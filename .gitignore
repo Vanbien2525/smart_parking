@@ -33,3 +33,6 @@ storage/uploads/gates_out/*
 # Model weights tải về (nếu nặng)
 *.pt
 *.onnx
+
+# Local progress tracking (chỉ lưu local, không push lên GitHub)
+progress.md
