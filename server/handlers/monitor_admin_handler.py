@@ -488,6 +488,49 @@ class MonitorAdminHandler:
             raise BusinessError(f"Phiên kết nối '{session_id}' không còn tồn tại trên RAM.")
         return {"session": target.to_public_dict()}
 
+    # ==========================================================================
+    # NHÓM 4.4: ADMIN XEM NHẬT KÝ HỆ THỐNG (4.4.1 - 4.4.3)
+    # ==========================================================================
+    def handle_admin_query_logs(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.4.1 / 4.4.2 / 4.4.3: Truy vấn nhật ký thao tác, đăng nhập và lỗi hệ thống."""
+        log_type = str(payload.get("log_type") or "audit").strip()
+        if log_type not in ("audit", "auth", "error", "parking_history"):
+            raise BusinessError(f"Loại nhật ký không hợp lệ: '{log_type}'.")
+
+        start_date = payload.get("start_date")
+        end_date = payload.get("end_date")
+        limit = int(payload.get("limit") or 200)
+
+        filters: Dict[str, Any] = {}
+        for key in (
+            "ma_tai_khoan",
+            "ten_dang_nhap",
+            "vai_tro",
+            "loai_thao_tac",
+            "doi_tuong",
+            "ket_qua",
+            "muc_do",
+            "nguon",
+            "keyword",
+        ):
+            if payload.get(key) not in (None, ""):
+                filters[key] = payload[key]
+
+        items = self.file_logger.query_logs(
+            log_type=log_type,
+            start_date=start_date,
+            end_date=end_date,
+            filters=filters,
+            limit=limit,
+        )
+        return {
+            "log_type": log_type,
+            "total": len(items),
+            "items": items,
+        }
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -541,6 +584,13 @@ def register_monitor_admin_routes(
     router.register(
         Actions.ADMIN_GET_SESSION,
         handler.handle_admin_get_session,
+        allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_QUERY_LOGS,
+        handler.handle_admin_query_logs,
         allowed_roles=[Roles.ADMIN.value],
         is_mutation=False,
         require_auth=True,
