@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from server.core.file_logger import FileLogger
-from server.core.router import Router
+from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession, SessionManager
 from server.core.state_store import StateStore
 from shared.constants import (
@@ -321,6 +321,141 @@ class MonitorAdminHandler:
             "items": alert_items[:25],
         }
 
+    # ==========================================================================
+    # NHÓM 4.2: ADMIN XEM & TRA CỨU TÀI KHOẢN HỆ THỐNG (4.2.1 - 4.2.5)
+    # ==========================================================================
+    def handle_admin_list_accounts(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.2.1 / 4.2.3 / 4.2.4: Admin xem danh sách tài khoản hệ thống (ẩn mat_khau_bam)."""
+        db = self._db()
+        vai_tro = str(payload.get("vai_tro") or "").strip()
+        if payload.get("only_managers"):
+            vai_tro = Roles.QUAN_LY.value
+        trang_thai = str(payload.get("trang_thai") or "").strip()
+        keyword = str(payload.get("keyword") or payload.get("ten_dang_nhap") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if vai_tro:
+            conditions.append("tk.vai_tro = %s")
+            params.append(vai_tro)
+        if trang_thai:
+            conditions.append("tk.trang_thai = %s")
+            params.append(trang_thai)
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(tk.ten_dang_nhap ILIKE %s OR COALESCE(cd.ho_ten, nv.ho_ten, '') ILIKE %s "
+                "OR COALESCE(cd.email, nv.email, '') ILIKE %s)"
+            )
+            params.extend([like, like, like])
+
+        where_sql = " AND ".join(conditions)
+        rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT tk.ma_tai_khoan,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   tk.trang_thai,
+                   tk.ly_do_khoa,
+                   tk.ngay_tao,
+                   COALESCE(cd.ho_ten, nv.ho_ten, tk.ten_dang_nhap) AS ho_ten,
+                   COALESCE(cd.so_dien_thoai, nv.so_dien_thoai, '') AS so_dien_thoai,
+                   COALESCE(cd.email, nv.email, '') AS email,
+                   cd.ma_can_ho,
+                   nv.ma_nhan_vien_code,
+                   nv.chuc_vu
+            FROM tai_khoan tk
+            LEFT JOIN cu_dan cd ON cd.ma_tai_khoan = tk.ma_tai_khoan
+            LEFT JOIN nhan_vien nv ON nv.ma_tai_khoan = tk.ma_tai_khoan
+            WHERE {where_sql}
+            ORDER BY tk.ma_tai_khoan ASC
+            """,
+            tuple(params),
+        )
+        return {
+            "db_connected": db is not None,
+            "total": len(rows),
+            "items": rows,
+        }
+
+    def handle_admin_get_account(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.2.2 / 4.2.3 / 4.2.4: Admin xem chi tiết tài khoản, trạng thái khóa & đăng nhập gần nhất."""
+        ma_tai_khoan = payload.get("ma_tai_khoan")
+        if ma_tai_khoan is None:
+            raise BusinessError("Thiếu `ma_tai_khoan` để xem chi tiết.")
+
+        db = self._db()
+        account = _safe_fetch_one(
+            db,
+            """
+            SELECT tk.ma_tai_khoan,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   tk.trang_thai,
+                   tk.ly_do_khoa,
+                   tk.ngay_tao,
+                   COALESCE(cd.ho_ten, nv.ho_ten, tk.ten_dang_nhap) AS ho_ten,
+                   COALESCE(cd.so_cccd, nv.so_cccd, '') AS so_cccd,
+                   COALESCE(cd.so_dien_thoai, nv.so_dien_thoai, '') AS so_dien_thoai,
+                   COALESCE(cd.email, nv.email, '') AS email,
+                   cd.ma_cu_dan,
+                   cd.ma_can_ho,
+                   cd.dia_chi,
+                   nv.ma_nhan_vien,
+                   nv.ma_nhan_vien_code,
+                   nv.chuc_vu
+            FROM tai_khoan tk
+            LEFT JOIN cu_dan cd ON cd.ma_tai_khoan = tk.ma_tai_khoan
+            LEFT JOIN nhan_vien nv ON nv.ma_tai_khoan = tk.ma_tai_khoan
+            WHERE tk.ma_tai_khoan = %s
+            """,
+            (int(ma_tai_khoan),),
+        )
+        if db is not None and account is None:
+            raise BusinessError(f"Không tìm thấy tài khoản mã {ma_tai_khoan}.")
+
+        last_auth = self.file_logger.get_last_auth_for_account(int(ma_tai_khoan))
+        active_sessions = [
+            s for s in self.session_manager.list_sessions()
+            if s.get("ma_tai_khoan") == int(ma_tai_khoan)
+        ]
+        return {
+            "db_connected": db is not None,
+            "account": account,
+            "last_login": last_auth,
+            "active_sessions": active_sessions,
+        }
+
+    def handle_admin_account_history(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.2.5: Tra cứu lịch sử trạng thái (khóa/mở khóa) của tài khoản từ audit_*.jsonl."""
+        ma_tai_khoan = payload.get("ma_tai_khoan")
+        start_date = payload.get("start_date")
+        end_date = payload.get("end_date")
+        limit = int(payload.get("limit") or 100)
+
+        filters: Dict[str, Any] = {"doi_tuong": "tai_khoan"}
+        if ma_tai_khoan is not None and str(ma_tai_khoan).strip() != "":
+            filters["ma_doi_tuong"] = int(ma_tai_khoan)
+
+        items = self.file_logger.query_logs(
+            "audit",
+            start_date=start_date,
+            end_date=end_date,
+            filters=filters,
+            limit=limit,
+        )
+        return {
+            "total": len(items),
+            "items": items,
+        }
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -340,6 +475,27 @@ def register_monitor_admin_routes(
         Actions.DASHBOARD_SUMMARY,
         handler.handle_dashboard_summary,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_LIST_ACCOUNTS,
+        handler.handle_admin_list_accounts,
+        allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_GET_ACCOUNT,
+        handler.handle_admin_get_account,
+        allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_ACCOUNT_HISTORY,
+        handler.handle_admin_account_history,
+        allowed_roles=[Roles.ADMIN.value],
         is_mutation=False,
         require_auth=True,
     )
