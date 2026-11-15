@@ -1,0 +1,401 @@
+{
+  "meta": {
+    "name": "Dao Tien Smart Parking — Enterprise Control Center DNA",
+    "description": "Design DNA thống nhất cho toàn bộ ứng dụng Desktop PySide6 (Client–Server TCP Socket) của Hệ thống Quản lý Bãi giữ xe Chung cư Đào Tiên, phục vụ đồng bộ 4 vai trò: Quản lý chung cư, Nhân viên bãi xe, Cư dân và Admin (Read-only).",
+    "source_references": [
+      "D:/Lap_trinh_mang/Menu_Bai_xe_Dao_Tien_sieu_cap_V5.html",
+      "D:/Lap_trinh_mang/csdl_workflow siu cấp.html"
+    ],
+    "created_at": "2026-11-16T00:42:00+07:00"
+  },
+  "design_system": {
+    "color": {
+      "palette_type": "split-complementary",
+      "primary": {
+        "hex": "#0F172A",
+        "role": "Deep Midnight Navy cho Sidebar điều hướng cố định, tiêu đề chính và khung nhận diện thương hiệu Chung cư Đào Tiên"
+      },
+      "secondary": {
+        "hex": "#2563EB",
+        "role": "Royal Blue cho hành động chính (Primary CTA), mục menu đang chọn và vai trò Quản lý chung cư"
+      },
+      "accent": {
+        "hex": "#0D9488",
+        "role": "Emerald Teal cho trạng thái vận hành thời gian thực, kết nối Socket Online và vai trò Nhân viên bãi xe"
+      },
+      "neutral": {
+        "scale": [
+          "#FFFFFF",
+          "#F8FAFC",
+          "#F1F5F9",
+          "#E2E8F0",
+          "#CBD5E1",
+          "#94A3B8",
+          "#64748B",
+          "#475569",
+          "#334155",
+          "#1E293B",
+          "#0F172A",
+          "#0B132B"
+        ],
+        "usage": "Nền vùng làm việc dùng #F8FAFC; bề mặt Card và Bảng dùng #FFFFFF; viền mảnh dùng #E2E8F0; chữ chính dùng #0F172A; chữ phụ/nhãn cột dùng #64748B; Sidebar tối dùng #0B132B và #0F172A với chữ #F8FAFC."
+      },
+      "semantic": {
+        "success": "#16A34A",
+        "warning": "#D97706",
+        "error": "#DC2626",
+        "info": "#0284C7"
+      },
+      "surface": {
+        "background": "#F8FAFC",
+        "card": "#FFFFFF",
+        "elevated": "#F1F5F9"
+      },
+      "role_accents": {
+        "quan_ly": {
+          "label": "Quản lý chung cư",
+          "hex": "#2563EB",
+          "bg_soft": "#EFF6FF",
+          "border": "#BFDBFE"
+        },
+        "nhan_vien": {
+          "label": "Nhân viên bãi xe",
+          "hex": "#0D9488",
+          "bg_soft": "#F0FDFA",
+          "border": "#99F6E4"
+        },
+        "cu_dan": {
+          "label": "Cư dân",
+          "hex": "#4F46E5",
+          "bg_soft": "#EEF2FF",
+          "border": "#C7D2FE"
+        },
+        "admin": {
+          "label": "Admin (Chỉ xem)",
+          "hex": "#D97706",
+          "bg_soft": "#FFFBEB",
+          "border": "#FDE68A"
+        }
+      },
+      "parking_slot_states": {
+        "trong": {
+          "label": "Trống",
+          "bg": "#DCFCE7",
+          "border": "#86EFAC",
+          "text": "#166534"
+        },
+        "da_phan_cho": {
+          "label": "Đã phân chỗ",
+          "bg": "#DBEAFE",
+          "border": "#93C5FD",
+          "text": "#1E40AF"
+        },
+        "dang_co_xe": {
+          "label": "Đang có xe",
+          "bg": "#FEE2E2",
+          "border": "#FCA5A5",
+          "text": "#991B1B"
+        },
+        "ngung_su_dung": {
+          "label": "Ngừng sử dụng",
+          "bg": "#F1F5F9",
+          "border": "#CBD5E1",
+          "text": "#475569"
+        }
+      },
+      "contrast_strategy": "dark-on-light dominant cho vùng nội dung và high-contrast light-on-midnight cho thanh Sidebar cố định"
+    },
+    "typography": {
+      "type_scale": {
+        "display": { "size": "28px", "weight": "700", "line_height": "36px", "tracking": "-0.02em" },
+        "heading_1": { "size": "22px", "weight": "700", "line_height": "30px", "tracking": "-0.015em" },
+        "heading_2": { "size": "17px", "weight": "600", "line_height": "24px", "tracking": "-0.01em" },
+        "heading_3": { "size": "15px", "weight": "600", "line_height": "22px", "tracking": "0em" },
+        "body": { "size": "13.5px", "weight": "400", "line_height": "20px", "tracking": "0em" },
+        "body_small": { "size": "12.5px", "weight": "400", "line_height": "18px", "tracking": "0em" },
+        "caption": { "size": "11.5px", "weight": "500", "line_height": "16px", "tracking": "0.01em" },
+        "overline": { "size": "11px", "weight": "700", "line_height": "14px", "tracking": "0.08em" }
+      },
+      "font_families": {
+        "heading": "'Segoe UI Variable Display', 'Inter', 'Segoe UI', sans-serif",
+        "body": "'Segoe UI Variable Text', 'Inter', 'Segoe UI', sans-serif",
+        "mono": "'JetBrains Mono', 'Cascadia Mono', 'Consolas', monospace"
+      },
+      "font_style_notes": "Sans-serif sắc nét cho giao diện tiếng Việt Windows; bắt buộc dùng font monospace cho Biển số xe, Mã vị trí đỗ, Mã hóa đơn, Số tiền VNĐ và Timestamp log."
+    },
+    "spacing": {
+      "base_unit": "4px",
+      "scale": {
+        "xs": "4px",
+        "sm": "8px",
+        "md": "12px",
+        "lg": "16px",
+        "xl": "20px",
+        "2xl": "24px",
+        "3xl": "32px"
+      },
+      "content_density": "comfortable",
+      "section_rhythm": "Khoảng cách giữa các Section/Card là 16px; padding bên trong Card là 16px–20px; lề vùng nội dung chính là 20px–24px."
+    },
+    "layout": {
+      "grid_system": "Desktop Application Shell: Sidebar cố định bên trái (256px mở rộng / 72px thu gọn) + Topbar 56px + Vùng nội dung chính QStackedWidget linh hoạt",
+      "max_content_width": "1440px",
+      "columns": 12,
+      "gutter": "16px",
+      "breakpoints": {
+        "compact_desktop": "1024px",
+        "standard_desktop": "1280px",
+        "wide_desktop": "1536px"
+      },
+      "alignment_tendency": "strict grid"
+    },
+    "shape": {
+      "border_radius": {
+        "small": "6px",
+        "medium": "10px",
+        "large": "14px",
+        "pill": "9999px"
+      },
+      "border_usage": "subtle 1px",
+      "divider_style": "Đường kẻ mảnh 1px solid #E2E8F0 tách biệt Topbar, Header Card và các hàng bảng dữ liệu"
+    },
+    "elevation": {
+      "shadow_style": "soft diffused",
+      "levels": {
+        "low": "0 1px 2px rgba(15, 23, 42, 0.05)",
+        "medium": "0 4px 12px rgba(15, 23, 42, 0.08)",
+        "high": "0 12px 28px rgba(15, 23, 42, 0.16)"
+      },
+      "depth_cues": "surface contrast + viền mảnh 1px #E2E8F0; chỉ dùng QGraphicsDropShadowEffect cho Dialog nổi, Toast và Card KPI quan trọng"
+    },
+    "iconography": {
+      "style": "outline geometric",
+      "stroke_weight": "1.75px",
+      "size_scale": {
+        "sm": "16px",
+        "md": "18px",
+        "lg": "22px",
+        "xl": "28px"
+      },
+      "preferred_set": "Qt Standard Icons / Unicode Crisp Badges + Vector SVG inline đơn sắc (2px stroke)"
+    },
+    "motion": {
+      "easing": "cubic-bezier(0.16, 1, 0.3, 1)",
+      "duration_scale": {
+        "micro": "120ms",
+        "normal": "200ms",
+        "macro": "300ms"
+      },
+      "entrance_pattern": "Toast trượt nhẹ từ góc phải dưới với fade-in 180ms; Dialog khẩn cấp mở tức thì với viền nhấn đỏ.",
+      "exit_pattern": "Fade-out gọn 150ms cho Toast thông báo thường.",
+      "philosophy": "minimal functional"
+    },
+    "components": {
+      "button_style": "Chiều cao chuẩn 36px (compact 30px trong bảng), bo góc 8px, chữ SemiBold 13px; phân cấp rõ Primary (#2563EB), Success (#16A34A), Danger (#DC2626), Secondary viền #CBD5E1 và Ghost.",
+      "input_style": "Chiều cao chuẩn 38px, nền #FFFFFF, viền 1px solid #CBD5E1, bo góc 8px; khi focus đổi viền sang #2563EB (2px) hoặc màu nhấn vai trò; trạng thái Read-only dùng nền #F1F5F9.",
+      "card_style": "Nền trắng #FFFFFF, viền 1px solid #E2E8F0, bo góc 12px, padding 16px–20px; StatCard hiển thị nhãn trên, số KPI lớn 26px bold và chỉ số phụ.",
+      "navigation_pattern": "Sidebar tối #0B132B phân nhóm chức năng theo đúng mã Menu V5, mục active có thanh chỉ báo dọc 3px bên trái và nền #1E293B; Topbar 56px chứa tiêu đề trang, RoleBadge, trạng thái Socket và nút chuông thông báo.",
+      "modal_style": "Dialog bo góc 14px, nền trắng #FFFFFF, thanh tiêu đề rõ ràng; riêng EmergencyDialog có header đỏ #DC2626 và nút bắt buộc 'Xác nhận đã tiếp nhận'.",
+      "list_style": "QTableWidget nền trắng, header #F8FAFC chữ viết hoa nhẹ 11.5px màu #64748B, dòng xen kẽ subtle hover #F1F5F9, chiều cao dòng 42px, tắt đường lưới dọc để thoáng mắt.",
+      "component_notes": "Tất cả 4 vai trò dùng chung 1 Shell; Admin gắn thêm ReadOnlyBanner vàng nhạt đầu trang và vô hiệu hóa toàn bộ nút ghi/sửa/xóa."
+    }
+  },
+  "design_style": {
+    "aesthetic": {
+      "mood": ["chuyên nghiệp", "tin cậy", "sắc nét", "kiểm soát tốt"],
+      "visual_metaphor": "Trung tâm điều hành thông minh (Smart Control Center) — rõ ràng, tức thời, phân cấp thị giác mạch lạc như phần mềm Enterprise SaaS",
+      "era_influence": "Modern Enterprise Desktop SaaS (2025–2026)",
+      "genre": "enterprise SaaS & security operations desktop",
+      "personality_traits": ["chính xác", "quy củ", "phản hồi nhanh", "minh bạch"],
+      "adjectives": ["gọn gàng", "hiện đại", "thống nhất", "trực quan", "độ tin cậy cao"]
+    },
+    "visual_language": {
+      "complexity": "moderate",
+      "ornamentation": "subtle accents",
+      "whitespace_usage": "Thoáng ở khu vực tiêu đề, giữa các Card và trong bảng dữ liệu; giữ vừa đủ chặt tại màn hình Cổng vào/ra để Nhân viên thao tác nhanh trong 1 tầm mắt.",
+      "visual_weight_distribution": "Trọng tâm thị giác neo ở Sidebar tối bên trái (18%) và các Card KPI / Khung Camera / Sơ đồ bãi xe ở vùng nội dung sáng (82%).",
+      "focal_strategy": "distributed interest",
+      "contrast_level": "high",
+      "texture_usage": "Màu phẳng sắc nét (flat surface layering), không dùng hoa văn rối mắt."
+    },
+    "composition": {
+      "hierarchy_method": "typographic hierarchy + spatial isolation + semantic color badges",
+      "balance_type": "asymmetric",
+      "flow_direction": "Trái sang phải (Sidebar -> Nội dung), Trên xuống dưới (Topbar -> Banner cảnh báo -> KPI -> Dữ liệu chi tiết)",
+      "grouping_strategy": "Nhóm thông tin theo Card chức năng; mỗi form nhập luôn đi kèm khung Xem trước / Trạng thái đối chiếu bên cạnh (Split 2-column trên màn rộng).",
+      "negative_space_role": "Tách biệt rõ nhóm hành động nguy hiểm/quan trọng (Duyệt, Thu hồi, Khẩn cấp) khỏi nhóm tra cứu."
+    },
+    "imagery": {
+      "photo_treatment": "Ảnh camera cổng vào/ra và ảnh cà vẹt xe giữ nguyên tỷ lệ khung hình, bo góc 10px, viền 1px #CBD5E1, nền khung chờ #0F172A cho Camera.",
+      "illustration_style": "Empty state dùng icon vector mảnh đơn sắc kèm 1 câu hướng dẫn ngắn.",
+      "graphic_elements": "Biển số xe hiển thị dạng PlateBadge mô phỏng biển trắng viền đen chữ monospace đậm; mã QR thanh toán đặt trong khung trắng căn giữa có đếm ngược thời gian hết hạn.",
+      "pattern_usage": "none",
+      "image_shape": "rounded-rectangle"
+    },
+    "interaction_feel": {
+      "feedback_style": "Tức thời: mọi nút gửi request qua Socket hiển thị trạng thái loading ngắn và phản hồi bằng Toast hoặc Badge cập nhật ngay.",
+      "hover_behavior": "Nút và hàng bảng đổi màu nền mượt (tint 6–8%), ô đỗ xe trên sơ đồ sáng viền khi di chuột.",
+      "transition_personality": "snappy",
+      "loading_style": "Inline indicator trên nút bấm hoặc trạng thái trên thanh Topbar khi chờ Server Socket trả lời.",
+      "microinteraction_density": "low-to-moderate"
+    },
+    "brand_voice_in_ui": {
+      "tone": "Rõ ràng, nghiệp vụ chuẩn mực, dứt khoát",
+      "formality": "Trang trọng vừa phải (tiếng Việt có dấu chuẩn xác, giữ thuật ngữ kỹ thuật phổ thông khi cần)",
+      "cta_style": "direct imperative",
+      "empty_state_approach": "Hiển thị lý do ngắn gọn + nút hành động gợi ý nếu có quyền thao tác",
+      "error_tone": "Thông báo nguyên nhân cụ thể và cách khắc phục ngay (ví dụ: ảnh mờ cần quét lại, mã QR đã hết hạn)"
+    }
+  },
+  "visual_effects": {
+    "overview": {
+      "effect_intensity": "subtle-accent",
+      "performance_tier": "lightweight",
+      "fallback_strategy": "reduce to flat QSS borders without QGraphicsDropShadowEffect on low-end machines",
+      "primary_technology": "PySide6 QSS + QPropertyAnimation + QGraphicsDropShadowEffect"
+    },
+    "background_effects": {
+      "type": "none",
+      "description": "Nền phẳng #F8FAFC và Sidebar #0B132B để tối ưu độ rõ nét của text, bảng biểu và video OpenCV 30fps.",
+      "technology": "PySide6 QSS",
+      "params": {
+        "color_palette": ["#F8FAFC", "#0B132B"],
+        "speed": "0",
+        "density": "0",
+        "opacity": "1.0",
+        "blend_mode": "normal"
+      }
+    },
+    "particle_systems": {
+      "enabled": false,
+      "type": "none",
+      "description": "Không sử dụng hệ thống hạt để tránh tốn CPU/GPU cạnh luồng nhận diện YOLO/EasyOCR.",
+      "technology": "none",
+      "params": {
+        "count": 0,
+        "shape": "none",
+        "size_range": "0",
+        "movement_pattern": "none",
+        "color_behavior": "none",
+        "interaction": "none",
+        "spawn_area": "none"
+      }
+    },
+    "3d_elements": {
+      "enabled": false,
+      "type": "none",
+      "description": "Sơ đồ bãi xe hiển thị dạng 2D Grid trực quan tốc độ cao, không dùng 3D.",
+      "technology": "none",
+      "params": {
+        "renderer": "none",
+        "lighting": "none",
+        "camera": "none",
+        "materials": "none",
+        "geometry": "none",
+        "post_processing": [],
+        "interaction_model": "none"
+      }
+    },
+    "shader_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "Không sử dụng custom shader.",
+      "technology": "none",
+      "params": {
+        "uniforms": {},
+        "vertex_manipulation": "none",
+        "fragment_output": "none",
+        "noise_type": "none",
+        "distortion": "none"
+      }
+    },
+    "scroll_effects": {
+      "parallax": {
+        "enabled": false,
+        "layers": "0",
+        "depth_range": "0",
+        "speed_curve": "none"
+      },
+      "scroll_triggered_animations": {
+        "enabled": false,
+        "trigger_points": "none",
+        "animation_type": "none",
+        "scrub_behavior": "none"
+      },
+      "scroll_morphing": {
+        "enabled": false,
+        "description": "Không sử dụng hiệu ứng morph khi cuộn."
+      }
+    },
+    "text_effects": {
+      "type": "none",
+      "description": "Chữ hiển thị sắc nét chuẩn hệ thống, không hiệu ứng phát sáng hay biến dạng.",
+      "technology": "PySide6 QLabel",
+      "params": {
+        "split_strategy": "none",
+        "animation_per_unit": "none",
+        "stagger": "0ms",
+        "effect_style": "none"
+      }
+    },
+    "cursor_effects": {
+      "enabled": false,
+      "type": "none",
+      "description": "Dùng con trỏ trỏ tay (PointingHandCursor) chuẩn hệ điều hành cho nút và ô đỗ bấm được.",
+      "params": {
+        "shape": "system-pointer",
+        "size": "default",
+        "blend_mode": "normal",
+        "trail": "none",
+        "interaction_zone": "buttons and clickable parking slot tiles"
+      }
+    },
+    "image_effects": {
+      "type": "none",
+      "description": "Khung camera OpenCV vẽ bounding box biển số bằng màu Emerald (#10B981) trực tiếp trên frame; ảnh tĩnh giữ bo góc 10px.",
+      "technology": "OpenCV + QPixmap",
+      "params": {
+        "filter_pipeline": "none",
+        "hover_transform": "none",
+        "reveal_animation": "none",
+        "distortion_type": "none"
+      }
+    },
+    "glassmorphism_neumorphism": {
+      "enabled": false,
+      "style": "none",
+      "params": {
+        "blur_radius": "0px",
+        "transparency": "1.0",
+        "border_treatment": "solid 1px #E2E8F0",
+        "shadow_type": "soft diffused drop shadow",
+        "light_source_angle": "top"
+      }
+    },
+    "canvas_drawings": {
+      "enabled": true,
+      "type": "data-visualization",
+      "description": "Vẽ biểu đồ doanh thu, lượt xe cư dân vs vãng lai bằng Matplotlib nhúng vào PySide6 theo đúng bảng màu DNA (#2563EB, #0D9488, #D97706).",
+      "technology": "Matplotlib FigureCanvasQTAgg",
+      "params": {
+        "draw_method": "vector-plot",
+        "animation_loop": "on-data-refresh",
+        "color_scheme": ["#2563EB", "#0D9488", "#D97706", "#DC2626"],
+        "responsiveness": "auto-resize inside Card layout",
+        "interaction": "hover tooltip"
+      }
+    },
+    "svg_animations": {
+      "enabled": false,
+      "type": "none",
+      "description": "Dùng QPropertyAnimation nhẹ cho Toast thông báo và chấm trạng thái Socket Online.",
+      "params": {
+        "animation_method": "QPropertyAnimation",
+        "path_morphing": "none",
+        "stroke_animation": "none",
+        "filter_effects": "none"
+      }
+    },
+    "composite_notes": "Ưu tiên tối đa hiệu năng PySide6 và phản hồi tức thời khi chạy song song luồng TCP Socket + OpenCV/EasyOCR. Mọi hiệu ứng bóng đổ và chuyển động giữ ở mức nhẹ, sạch sẽ."
+  }
+}
