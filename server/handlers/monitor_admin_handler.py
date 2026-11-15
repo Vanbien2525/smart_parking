@@ -456,6 +456,38 @@ class MonitorAdminHandler:
             "items": items,
         }
 
+    # ==========================================================================
+    # NHÓM 4.3: ADMIN XEM PHIÊN KẾT NỐI TRÊN RAM (4.3.1 - 4.3.2)
+    # ==========================================================================
+    def handle_admin_list_sessions(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.3.1: Xem danh sách các phiên kết nối TCP đang hoạt động trên RAM Server."""
+        vai_tro = payload.get("vai_tro")
+        ten_dang_nhap = payload.get("ten_dang_nhap")
+        authenticated_only = bool(payload.get("authenticated_only", False))
+        sessions = self.session_manager.list_sessions(
+            vai_tro=vai_tro,
+            ten_dang_nhap=ten_dang_nhap,
+            authenticated_only=authenticated_only,
+        )
+        return {
+            "total": len(sessions),
+            "items": sessions,
+        }
+
+    def handle_admin_get_session(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.3.2: Xem chi tiết một phiên kết nối theo `session_id`."""
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            raise BusinessError("Thiếu `session_id` để xem chi tiết phiên kết nối.")
+        target = self.session_manager.get_session(session_id)
+        if target is None:
+            raise BusinessError(f"Phiên kết nối '{session_id}' không còn tồn tại trên RAM.")
+        return {"session": target.to_public_dict()}
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -495,6 +527,20 @@ def register_monitor_admin_routes(
     router.register(
         Actions.ADMIN_ACCOUNT_HISTORY,
         handler.handle_admin_account_history,
+        allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_LIST_SESSIONS,
+        handler.handle_admin_list_sessions,
+        allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.ADMIN_GET_SESSION,
+        handler.handle_admin_get_session,
         allowed_roles=[Roles.ADMIN.value],
         is_mutation=False,
         require_auth=True,
