@@ -4,10 +4,12 @@ matplotlib>=3.9.0
 
 # Cơ sở dữ liệu PostgreSQL & Bảo mật
 psycopg[binary]>=3.2.0
+psycopg-pool>=3.2.0
 bcrypt>=4.1.0
 python-dotenv>=1.0.1
 
-# Nhận diện biển số thật (OpenCV + YOLO + OCR)
+# Nhận diện biển số thật (Hybrid: Gemini Vision API + OpenCV / YOLO / EasyOCR)
+google-genai>=2.30.1
 opencv-python>=4.10.0
 ultralytics>=8.3.0
 easyocr>=1.7.1
@@ -16,3 +18,7 @@ Pillow>=10.4.0
 
 # Tạo mã QR ảo thanh toán
 qrcode>=7.4.2
+
+# Kiểm thử tự động
+pytest>=8.0.0
+pytest-qt>=4.4.0

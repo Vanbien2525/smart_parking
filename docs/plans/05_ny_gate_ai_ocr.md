@@ -163,7 +163,7 @@ sequenceDiagram
   - **Cơ chế hoạt động 2 tầng tối ưu:**
     1. **Tầng 1 — `recognize_with_gemini_vision(frame_bgr)`:**
        - Kiểm tra biến môi trường `GEMINI_API_KEY` trong `.env`. Nếu có key:
-       - Nén nhanh ảnh JPEG chất lượng 85% trong bộ nhớ, gọi `google-genai` (`gemini-2.5-flash`) với System Prompt chuyên biệt cho biển số xe Việt Nam, yêu cầu trả về JSON nghiêm ngặt `{ "bien_so": "...", "loai_xe": "o_to" | "xe_may", "confidence": 0.98, "bbox": [ymin, xmin, ymax, xmax] }`.
+       - Nén nhanh ảnh JPEG chất lượng 85% trong bộ nhớ, gọi `google-genai` ưu tiên `GEMINI_MODEL` (`gemini-3.8-flash` — độ chính xác cao nhất; tự động chuyển sang `GEMINI_FALLBACK_MODEL` = `gemini-3.5-flash-lite` có hạn mức `15 RPM / 500 RPD` nếu model chính dính lỗi `429`/hết `20 RPD`) với System Prompt chuyên biệt cho biển số xe Việt Nam, yêu cầu trả về JSON nghiêm ngặt `{ "bien_so": "...", "loai_xe": "o_to" | "xe_may", "confidence": 0.98, "bbox": [ymin, xmin, ymax, xmax] }`.
        - Cắt ảnh vùng biển số (`plate_crop`) theo `bbox` để hiển thị lên ô "Ảnh cắt biển số" trên UI.
     2. **Tầng 2 (Fallback tự động) — `recognize_with_yolo_easyocr(frame_bgr)`:**
        - Nếu không cấu hình `GEMINI_API_KEY` hoặc lỗi kết nối mạng, tự động dùng `YOLO` phát hiện vùng biển số (hoặc OpenCV contour/aspect-ratio plate detector) kết hợp `easyocr.Reader(['en'], gpu=False)` để đọc các ký tự chữ và số.
