@@ -20,6 +20,7 @@ from client.ui.manager.stats_history_view import (
     ManagerMonitorView,
     ManagerStatsView,
 )
+from client.ui.manager.vehicle_approval_view import VehicleApprovalView
 from client.ui.theme.role_shell import RolePortalWindow
 
 
@@ -85,12 +86,15 @@ class AdminWindow(RolePortalWindow):
         if "4.6_infra_ro" not in custom_ro:
             infra_tabs = QTabWidget()
             self.ro_hr_view = HRView(socket_client=socket_client, read_only=True)
+            self.ro_vehicle_approval_view = VehicleApprovalView(socket_client=socket_client, read_only=True)
             self.ro_infra_pricing_view = InfraPricingView(socket_client=socket_client, read_only=True)
             infra_tabs.addTab(self.ro_hr_view, "4.6.1 Nhân sự & Cư dân")
+            infra_tabs.addTab(self.ro_vehicle_approval_view, "4.6.2 Phương tiện & Chỗ đỗ")
             infra_tabs.addTab(self.ro_infra_pricing_view, "4.6.3–4.6.4 Khu vực, Vị trí & Bảng giá")
             custom_ro["4.6_infra_ro"] = infra_tabs
         else:
             self.ro_hr_view = None
+            self.ro_vehicle_approval_view = None
             self.ro_infra_pricing_view = None
 
         if "4.7_finance_ro" not in custom_ro:
@@ -145,6 +149,7 @@ class AdminWindow(RolePortalWindow):
             self.dashboard_readonly_view.child_widget.refresh_data()
         for ro_view in (
             self.ro_hr_view,
+            self.ro_vehicle_approval_view,
             self.ro_infra_pricing_view,
             self.ro_stats_view,
             self.ro_finance_view,
