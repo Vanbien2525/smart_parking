@@ -1,11 +1,21 @@
 """Handler Quản lý Khu vực (1.4.5–1.4.9), Vị trí đỗ (1.4.10–1.4.14) & Bảng giá (1.5)."""
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from server.core.file_logger import FileLogger
 from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession
-from shared.constants import Roles, SlotGroups, SlotStatus, VehicleTypes, ZoneStatus
+from shared.constants import (
+    PricingGroups,
+    PricingStatus,
+    PricingUnits,
+    Roles,
+    SlotGroups,
+    SlotStatus,
+    VehicleTypes,
+    ZoneStatus,
+)
 from shared.protocol import Actions
 
 
@@ -499,6 +509,202 @@ class InfraPricingHandler:
         )
         return {"slot": updated}
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.5.1 - 1.5.4: CẤU HÌNH BẢNG GIÁ GỬI XE
+    # ==========================================================================
+    @staticmethod
+    def _validate_pricing_fields(
+        ma_loai_xe: str,
+        nhom_ap_dung: str,
+        don_vi_tinh: str,
+        raw_muc_phi: Any,
+    ) -> float:
+        if ma_loai_xe not in (VehicleTypes.O_TO.value, VehicleTypes.XE_MAY.value):
+            raise BusinessError("Loại phương tiện phải là `O_TO` hoặc `XE_MAY`.")
+        valid_groups = tuple(g.value for g in PricingGroups)
+        if nhom_ap_dung not in valid_groups:
+            raise BusinessError("Nhóm áp dụng giá không hợp lệ.")
+        valid_units = tuple(u.value for u in PricingUnits)
+        if don_vi_tinh not in valid_units:
+            raise BusinessError("Đơn vị tính phải là `thang`, `gio` hoặc `luot`.")
+        try:
+            muc_phi = float(raw_muc_phi)
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Mức phí phải là số hợp lệ.") from exc
+        if muc_phi < 0:
+            raise BusinessError("Mức phí không được âm.")
+        return muc_phi
+
+    def handle_create_pricing(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.5.1: Tạo cấu hình bảng giá mới."""
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip().upper()
+        nhom_ap_dung = str(payload.get("nhom_ap_dung") or "").strip()
+        don_vi_tinh = str(payload.get("don_vi_tinh") or "").strip()
+        muc_phi = self._validate_pricing_fields(
+            ma_loai_xe, nhom_ap_dung, don_vi_tinh, payload.get("muc_phi")
+        )
+        thoi_gian_bat_dau = payload.get("thoi_gian_bat_dau") or datetime.now().isoformat(timespec="seconds")
+
+        db = self._db()
+        row = db.execute_returning(
+            """
+            INSERT INTO bang_gia (
+                ma_loai_xe, nhom_ap_dung, don_vi_tinh, muc_phi, thoi_gian_bat_dau, trang_thai_gia
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING ma_bang_gia, ma_loai_xe, nhom_ap_dung, don_vi_tinh, muc_phi,
+                      thoi_gian_bat_dau, thoi_gian_ket_thuc, trang_thai_gia
+            """,
+            (
+                ma_loai_xe,
+                nhom_ap_dung,
+                don_vi_tinh,
+                muc_phi,
+                thoi_gian_bat_dau,
+                PricingStatus.DANG_AP_DUNG.value,
+            ),
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="TAO_BANG_GIA",
+            doi_tuong="bang_gia",
+            ma_doi_tuong=row["ma_bang_gia"],
+            gia_tri_cu=None,
+            gia_tri_moi=row,
+        )
+        return {"pricing": row}
+
+    def handle_update_pricing(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.5.2: Sửa bảng giá (chỉ cập nhật bang_gia, giữ nguyên tiền hóa đơn/giao dịch cũ)."""
+        ma_bang_gia = payload.get("ma_bang_gia")
+        if ma_bang_gia is None:
+            raise BusinessError("Thiếu `ma_bang_gia` để cập nhật.")
+
+        db = self._db()
+        old = db.fetch_one("SELECT * FROM bang_gia WHERE ma_bang_gia = %s", (int(ma_bang_gia),))
+        if not old:
+            raise BusinessError(f"Không tìm thấy bảng giá mã {ma_bang_gia}.")
+
+        try:
+            muc_phi = float(payload["muc_phi"]) if payload.get("muc_phi") is not None else float(old["muc_phi"])
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Mức phí phải là số hợp lệ.") from exc
+        if muc_phi < 0:
+            raise BusinessError("Mức phí không được âm.")
+
+        thoi_gian_bat_dau = payload.get("thoi_gian_bat_dau") or old["thoi_gian_bat_dau"]
+        updated = db.execute_returning(
+            """
+            UPDATE bang_gia
+            SET muc_phi = %s, thoi_gian_bat_dau = %s
+            WHERE ma_bang_gia = %s
+            RETURNING ma_bang_gia, ma_loai_xe, nhom_ap_dung, don_vi_tinh, muc_phi,
+                      thoi_gian_bat_dau, thoi_gian_ket_thuc, trang_thai_gia
+            """,
+            (muc_phi, thoi_gian_bat_dau, int(ma_bang_gia)),
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="SUA_BANG_GIA",
+            doi_tuong="bang_gia",
+            ma_doi_tuong=int(ma_bang_gia),
+            gia_tri_cu={"muc_phi": float(old["muc_phi"]), "thoi_gian_bat_dau": str(old["thoi_gian_bat_dau"])},
+            gia_tri_moi={"muc_phi": muc_phi, "thoi_gian_bat_dau": str(thoi_gian_bat_dau)},
+        )
+        return {"pricing": updated}
+
+    def handle_deactivate_pricing(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.5.3: Ngừng áp dụng một cấu hình bảng giá."""
+        ma_bang_gia = payload.get("ma_bang_gia")
+        if ma_bang_gia is None:
+            raise BusinessError("Thiếu `ma_bang_gia` để ngừng áp dụng.")
+
+        db = self._db()
+        old = db.fetch_one("SELECT * FROM bang_gia WHERE ma_bang_gia = %s", (int(ma_bang_gia),))
+        if not old:
+            raise BusinessError(f"Không tìm thấy bảng giá mã {ma_bang_gia}.")
+
+        updated = db.execute_returning(
+            """
+            UPDATE bang_gia
+            SET trang_thai_gia = %s,
+                thoi_gian_ket_thuc = CURRENT_TIMESTAMP
+            WHERE ma_bang_gia = %s
+            RETURNING ma_bang_gia, ma_loai_xe, nhom_ap_dung, don_vi_tinh, muc_phi,
+                      thoi_gian_bat_dau, thoi_gian_ket_thuc, trang_thai_gia
+            """,
+            (PricingStatus.NGUNG_AP_DUNG.value, int(ma_bang_gia)),
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="NGUNG_BANG_GIA",
+            doi_tuong="bang_gia",
+            ma_doi_tuong=int(ma_bang_gia),
+            gia_tri_cu={"trang_thai_gia": old["trang_thai_gia"]},
+            gia_tri_moi={"trang_thai_gia": PricingStatus.NGUNG_AP_DUNG.value},
+        )
+        return {"pricing": updated}
+
+    def handle_list_pricing(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.5.4: Xem danh sách bảng giá lọc theo nhóm áp dụng, loại xe, trạng thái và thời gian."""
+        nhom_ap_dung = str(payload.get("nhom_ap_dung") or "").strip()
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip().upper()
+        trang_thai_gia = str(payload.get("trang_thai_gia") or "").strip()
+        tu_ngay = str(payload.get("tu_ngay") or "").strip()
+        den_ngay = str(payload.get("den_ngay") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if nhom_ap_dung:
+            conditions.append("bg.nhom_ap_dung = %s")
+            params.append(nhom_ap_dung)
+        if ma_loai_xe:
+            conditions.append("bg.ma_loai_xe = %s")
+            params.append(ma_loai_xe)
+        if trang_thai_gia:
+            conditions.append("bg.trang_thai_gia = %s")
+            params.append(trang_thai_gia)
+        if tu_ngay:
+            conditions.append("bg.thoi_gian_bat_dau::date >= %s::date")
+            params.append(tu_ngay)
+        if den_ngay:
+            conditions.append("bg.thoi_gian_bat_dau::date <= %s::date")
+            params.append(den_ngay)
+
+        where_sql = " AND ".join(conditions)
+        rows = self._db().fetch_all(
+            f"""
+            SELECT bg.ma_bang_gia,
+                   bg.ma_loai_xe,
+                   lpt.ten_loai_xe,
+                   bg.nhom_ap_dung,
+                   bg.don_vi_tinh,
+                   bg.muc_phi,
+                   bg.thoi_gian_bat_dau,
+                   bg.thoi_gian_ket_thuc,
+                   bg.trang_thai_gia
+            FROM bang_gia bg
+            JOIN loai_phuong_tien lpt ON lpt.ma_loai_xe = bg.ma_loai_xe
+            WHERE {where_sql}
+            ORDER BY bg.trang_thai_gia ASC, bg.ma_bang_gia ASC
+            """,
+            tuple(params),
+        )
+        return {"total": len(rows), "items": rows}
+
 
 def register_infra_pricing_routes(
     router: Router,
@@ -576,6 +782,34 @@ def register_infra_pricing_routes(
         handler.handle_activate_slot,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.PRICING_CREATE,
+        handler.handle_create_pricing,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.PRICING_UPDATE,
+        handler.handle_update_pricing,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.PRICING_DEACTIVATE,
+        handler.handle_deactivate_pricing,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.PRICING_LIST,
+        handler.handle_list_pricing,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.ADMIN.value],
+        is_mutation=False,
         require_auth=True,
     )
     return handler
