@@ -8,10 +8,13 @@ Bao gồm đầy đủ 11 chức năng lá:
 """
 
 import base64
-from datetime import datetime
+from datetime import date, datetime
 import io
+import json
 import math
+import os
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -24,9 +27,11 @@ from server.core.session_manager import ClientSession, SessionManager
 from server.core.state_store import StateStore
 from shared.constants import (
     ParkingHistoryStatus,
+    PaymentMethods,
     PricingGroups,
     PricingStatus,
     Roles,
+    ShiftTypes,
     SlotStatus,
     VehicleStatus,
     VehicleTypes,
@@ -86,6 +91,7 @@ class GateHandler:
             if shift_state_file is not None
             else (cfg.state_dir / "shift_sessions.json")
         )
+        self._shift_lock = threading.RLock()
 
     def _db(self) -> Any:
         return _resolve_db(self._db_provider)
@@ -916,3 +922,415 @@ class GateHandler:
         raise BusinessError(
             f"Không tìm thấy phiên gửi xe đang mở trong bãi cho biển số '{normalized_plate}'!"
         )
+
+    # ==========================================================================
+    # HELPERS CA LÀM VIỆC & BÁO CÁO LƯỢT / THU PHÍ
+    # ==========================================================================
+    @staticmethod
+    def _determine_shift_info(dt: datetime) -> tuple[str, str]:
+        hour = dt.hour
+        if 6 <= hour < 14:
+            return ShiftTypes.CA_SANG.value, "Ca Sáng (06:00 - 14:00)"
+        if 14 <= hour < 22:
+            return ShiftTypes.CA_CHIEU.value, "Ca Chiều (14:00 - 22:00)"
+        return ShiftTypes.CA_DEM.value, "Ca Đêm (22:00 - 06:00)"
+
+    def _load_shift_sessions(self) -> List[Dict[str, Any]]:
+        with self._shift_lock:
+            if not self.shift_state_file.exists():
+                return []
+            try:
+                raw = self.shift_state_file.read_text(encoding="utf-8").strip()
+                if not raw:
+                    return []
+                data = json.loads(raw)
+                return [dict(x) for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+            except Exception:
+                return []
+
+    def _save_shift_sessions(self, items: List[Dict[str, Any]]) -> None:
+        with self._shift_lock:
+            self.shift_state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.shift_state_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            os.replace(tmp, self.shift_state_file)
+
+    def _resolve_staff_profile(self, db_or_tx: Any, session: ClientSession) -> Dict[str, Any]:
+        staff_id = self._resolve_staff_id(db_or_tx, session)
+        row = db_or_tx.fetch_one(
+            "SELECT ma_nhan_vien, ma_nhan_vien_code, ho_ten, chuc_vu FROM nhan_vien WHERE ma_nhan_vien = %s",
+            (staff_id,),
+        )
+        if row:
+            return dict(row)
+        return {
+            "ma_nhan_vien": staff_id,
+            "ma_nhan_vien_code": f"NV{staff_id:03d}",
+            "ho_ten": session.ho_ten or session.ten_dang_nhap or "Nhân viên bãi xe",
+            "chuc_vu": "nhan_vien_bai_xe",
+        }
+
+    def _ensure_open_shift(
+        self,
+        db_or_tx: Any,
+        session: ClientSession,
+        now_dt: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Đảm bảo nhân viên có ca làm việc đang mở (lưu bền vững trong shift_sessions.json)."""
+        now_val = now_dt or datetime.now()
+        staff = self._resolve_staff_profile(db_or_tx, session)
+        staff_id = int(staff["ma_nhan_vien"])
+        shift_code, shift_label = self._determine_shift_info(now_val)
+
+        with self._shift_lock:
+            shifts = self._load_shift_sessions()
+            for item in shifts:
+                if int(item.get("ma_nhan_vien") or 0) == staff_id and item.get("trang_thai_ca") == "dang_mo":
+                    return dict(item)
+
+            new_shift = {
+                "ma_ca_lam_viec": f"CA-{now_val.strftime('%Y%m%d%H%M%S')}-NV{staff_id}",
+                "ma_nhan_vien": staff_id,
+                "ma_nhan_vien_code": staff.get("ma_nhan_vien_code") or f"NV{staff_id:03d}",
+                "ho_ten": staff.get("ho_ten") or "",
+                "ca_lam_viec": shift_code,
+                "ten_ca": shift_label,
+                "ngay_ghi_nhan": now_val.date().isoformat(),
+                "gio_bat_dau": now_val.isoformat(timespec="seconds"),
+                "gio_ket_thuc": None,
+                "trang_thai_ca": "dang_mo",
+            }
+            shifts.insert(0, new_shift)
+            self._save_shift_sessions(shifts)
+            return dict(new_shift)
+
+    def _upsert_shift_report(
+        self,
+        tx: Any,
+        staff_id: int,
+        ma_khu_vuc: Optional[str],
+        ngay_ghi_nhan: date,
+        ca_lam_viec: str,
+        delta_oto_vl: int = 0,
+        delta_xemay_vl: int = 0,
+        delta_cu_dan: int = 0,
+        delta_tien: float = 0.0,
+    ) -> None:
+        """Cập nhật cộng dồn vào bảng 14 `bao_cao_luot_va_thu_phi`."""
+        if not ma_khu_vuc:
+            return
+        existing = tx.fetch_one(
+            """
+            SELECT ma_bao_cao
+            FROM bao_cao_luot_va_thu_phi
+            WHERE ma_nhan_vien = %s
+              AND ma_khu_vuc = %s
+              AND ngay_ghi_nhan = %s
+              AND ca_lam_viec = %s
+            LIMIT 1
+            """,
+            (staff_id, ma_khu_vuc, ngay_ghi_nhan, ca_lam_viec),
+        )
+        if existing:
+            tx.execute(
+                """
+                UPDATE bao_cao_luot_va_thu_phi
+                SET so_luot_oto_vang_lai = so_luot_oto_vang_lai + %s,
+                    so_luot_xemay_vang_lai = so_luot_xemay_vang_lai + %s,
+                    so_luot_xe_cu_dan = so_luot_xe_cu_dan + %s,
+                    tong_tien_thu_vang_lai = tong_tien_thu_vang_lai + %s
+                WHERE ma_bao_cao = %s
+                """,
+                (delta_oto_vl, delta_xemay_vl, delta_cu_dan, delta_tien, int(existing["ma_bao_cao"])),
+            )
+        else:
+            tx.execute(
+                """
+                INSERT INTO bao_cao_luot_va_thu_phi (
+                    ma_nhan_vien, ma_khu_vuc, ngay_ghi_nhan, ca_lam_viec,
+                    so_luot_oto_vang_lai, so_luot_xemay_vang_lai,
+                    so_luot_xe_cu_dan, tong_tien_thu_vang_lai
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    staff_id,
+                    ma_khu_vuc,
+                    ngay_ghi_nhan,
+                    ca_lam_viec,
+                    delta_oto_vl,
+                    delta_xemay_vl,
+                    delta_cu_dan,
+                    delta_tien,
+                ),
+            )
+
+    # ==========================================================================
+    # NHÓM 2.3.3 (WORKFLOW 04): XÁC NHẬN XE RA, THU PHÍ VÃNG LAI & MỞ CỔNG
+    # ==========================================================================
+    def handle_gate_out_confirm(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.3.3: Xác nhận thu phí (nếu vãng lai) & mở barie cổng ra ACID."""
+        self._ensure_staff_role(session)
+
+        raw_plate = str(payload.get("bien_so") or payload.get("bien_so_xe") or "").strip()
+        if not raw_plate:
+            raise BusinessError("Thiếu biển số xe để xác nhận mở cổng ra.")
+
+        ok_plate, valid_or_err = validate_plate(raw_plate)
+        if not ok_plate:
+            raise BusinessError(valid_or_err)
+        normalized_plate = valid_or_err
+
+        payment_method = str(payload.get("phuong_thuc_thanh_toan") or PaymentMethods.TIEN_MAT.value).strip()
+        if payment_method not in (PaymentMethods.TIEN_MAT.value, PaymentMethods.CHUYEN_KHOAN_QR.value):
+            raise BusinessError("Phương thức thanh toán phải là 'tien_mat' hoặc 'chuyen_khoan_qr'.")
+
+        gate_out_b64 = payload.get("gate_out_image_base64") or payload.get("gate_image_base64") or payload.get("anh_ra_base64")
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat(timespec="seconds")
+        db = self._db()
+
+        exit_record: Dict[str, Any] = {}
+        pop_visitor_plate: Optional[str] = None
+
+        with db.transaction() as tx:
+            shift_info = self._ensure_open_shift(tx, session, now_dt=now_dt)
+            staff_id = int(shift_info["ma_nhan_vien"])
+            ca_code = str(shift_info["ca_lam_viec"])
+
+            resident_in = tx.fetch_one(
+                """
+                SELECT pt.ma_phuong_tien, pt.ma_loai_xe, pt.bien_so_xe,
+                       cd.ho_ten, cd.ma_can_ho,
+                       ql.ma_vi_tri_co_dinh, ql.ma_khu_vuc_phan_cong, ql.thoi_gian_vao,
+                       vt.ten_vi_tri AS ten_vi_tri_co_dinh,
+                       vt.ma_khu_vuc AS ma_khu_vuc_vi_tri,
+                       kv.ten_khu_vuc
+                FROM quan_ly_phuong_tien_ra_vao ql
+                JOIN phuong_tien pt ON pt.ma_phuong_tien = ql.ma_phuong_tien
+                JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+                LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = ql.ma_vi_tri_co_dinh
+                LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = COALESCE(ql.ma_khu_vuc_phan_cong, vt.ma_khu_vuc)
+                WHERE pt.bien_so_xe = %s AND ql.dang_trong_bai = TRUE
+                """,
+                (normalized_plate,),
+            )
+
+            if resident_in:
+                ma_pt = int(resident_in["ma_phuong_tien"])
+                ma_loai_xe = str(resident_in.get("ma_loai_xe") or VehicleTypes.O_TO.value)
+                ma_vi_tri = resident_in.get("ma_vi_tri_co_dinh")
+                ma_khu_vuc = (
+                    resident_in.get("ma_khu_vuc_phan_cong")
+                    or resident_in.get("ma_khu_vuc_vi_tri")
+                    or ""
+                )
+                entry_log = self._find_open_entry_log(normalized_plate)
+                entry_dt = self._parse_iso_datetime(
+                    resident_in.get("thoi_gian_vao") or (entry_log or {}).get("thoi_gian_vao"),
+                    fallback=now_dt,
+                )
+                saved_out_path = self._save_gate_image(
+                    gate_out_b64, self.gates_out_dir, f"out_{normalized_plate}"
+                )
+
+                tx.execute(
+                    """
+                    UPDATE quan_ly_phuong_tien_ra_vao
+                    SET dang_trong_bai = FALSE,
+                        thoi_gian_ra = %s
+                    WHERE ma_phuong_tien = %s
+                    """,
+                    (now_dt, ma_pt),
+                )
+                if ma_loai_xe == VehicleTypes.O_TO.value and ma_vi_tri:
+                    tx.execute(
+                        """
+                        UPDATE vi_tri_do
+                        SET trang_thai_vi_tri = %s,
+                            thoi_gian_cap_nhat = %s
+                        WHERE ma_vi_tri = %s
+                        """,
+                        (SlotStatus.DA_PHAN_CHO.value, now_dt, ma_vi_tri),
+                    )
+                if ma_khu_vuc:
+                    tx.execute(
+                        """
+                        UPDATE khu_vuc
+                        SET so_xe_dang_gui = GREATEST(0, so_xe_dang_gui - 1)
+                        WHERE ma_khu_vuc = %s
+                        """,
+                        (ma_khu_vuc,),
+                    )
+                    self._upsert_shift_report(
+                        tx,
+                        staff_id=staff_id,
+                        ma_khu_vuc=ma_khu_vuc,
+                        ngay_ghi_nhan=now_dt.date(),
+                        ca_lam_viec=ca_code,
+                        delta_cu_dan=1,
+                    )
+
+                ma_luot_gui = (entry_log or {}).get("ma_luot_gui") or f"LG-{now_dt.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+                exit_record = {
+                    "ma_luot_gui": ma_luot_gui,
+                    "loai_khach": "cu_dan",
+                    "bien_so_xe": normalized_plate,
+                    "ma_loai_xe": ma_loai_xe,
+                    "ma_vi_tri": ma_vi_tri,
+                    "ten_vi_tri": resident_in.get("ten_vi_tri_co_dinh") or ma_vi_tri or "",
+                    "ma_khu_vuc": ma_khu_vuc,
+                    "ten_khu_vuc": resident_in.get("ten_khu_vuc") or ma_khu_vuc,
+                    "thoi_gian_vao": entry_dt.isoformat(timespec="seconds"),
+                    "thoi_gian_ra": now_iso,
+                    "anh_vao": (entry_log or {}).get("anh_vao"),
+                    "anh_ra": saved_out_path,
+                    "tien_thu": 0.0,
+                    "phuong_thuc_thanh_toan": "ve_thang",
+                    "ma_nhan_vien_vao": (entry_log or {}).get("ma_nhan_vien_vao"),
+                    "ma_nhan_vien_ra": staff_id,
+                    "ma_ca_lam_viec": shift_info["ma_ca_lam_viec"],
+                    "ca_lam_viec": ca_code,
+                    "ho_ten_chu_xe": resident_in.get("ho_ten") or "",
+                    "ma_can_ho": resident_in.get("ma_can_ho") or "",
+                    "barrier_status": "OPENED",
+                }
+            else:
+                visitor = self.state_store.get_visitor_by_plate(normalized_plate)
+                if visitor is None:
+                    raise BusinessError(
+                        f"Không tìm thấy phiên gửi xe đang mở trong bãi cho biển số '{normalized_plate}'!"
+                    )
+
+                ma_loai_xe = str(visitor.get("ma_loai_xe") or VehicleTypes.O_TO.value)
+                ma_vi_tri = visitor.get("ma_vi_tri")
+                ma_khu_vuc = str(visitor.get("ma_khu_vuc") or "")
+                entry_dt = self._parse_iso_datetime(visitor.get("thoi_gian_vao"), fallback=now_dt)
+                fee_info = self._calculate_visitor_fee(tx, ma_loai_xe, entry_dt, now_dt)
+                so_tien = float(fee_info["so_tien_phai_thu"])
+                saved_out_path = self._save_gate_image(
+                    gate_out_b64, self.gates_out_dir, f"out_{normalized_plate}"
+                )
+
+                if ma_loai_xe == VehicleTypes.O_TO.value and ma_vi_tri:
+                    tx.execute(
+                        """
+                        UPDATE vi_tri_do
+                        SET trang_thai_vi_tri = %s,
+                            thoi_gian_cap_nhat = %s
+                        WHERE ma_vi_tri = %s
+                        """,
+                        (SlotStatus.TRONG.value, now_dt, ma_vi_tri),
+                    )
+                if ma_khu_vuc:
+                    tx.execute(
+                        """
+                        UPDATE khu_vuc
+                        SET so_xe_dang_gui = GREATEST(0, so_xe_dang_gui - 1)
+                        WHERE ma_khu_vuc = %s
+                        """,
+                        (ma_khu_vuc,),
+                    )
+                    self._upsert_shift_report(
+                        tx,
+                        staff_id=staff_id,
+                        ma_khu_vuc=ma_khu_vuc,
+                        ngay_ghi_nhan=now_dt.date(),
+                        ca_lam_viec=ca_code,
+                        delta_oto_vl=1 if ma_loai_xe == VehicleTypes.O_TO.value else 0,
+                        delta_xemay_vl=1 if ma_loai_xe == VehicleTypes.XE_MAY.value else 0,
+                        delta_tien=so_tien,
+                    )
+
+                pop_visitor_plate = normalized_plate
+                ma_tham_chieu = f"VL-{now_dt.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:4].upper()}"
+                exit_record = {
+                    "ma_luot_gui": str(visitor.get("ma_luot_gui") or ma_tham_chieu),
+                    "ma_tham_chieu": ma_tham_chieu,
+                    "loai_khach": "vang_lai",
+                    "bien_so_xe": normalized_plate,
+                    "ma_loai_xe": ma_loai_xe,
+                    "ma_vi_tri": ma_vi_tri,
+                    "ten_vi_tri": visitor.get("ten_vi_tri") or ma_vi_tri or "",
+                    "ma_khu_vuc": ma_khu_vuc,
+                    "ten_khu_vuc": visitor.get("ten_khu_vuc") or ma_khu_vuc,
+                    "thoi_gian_vao": entry_dt.isoformat(timespec="seconds"),
+                    "thoi_gian_ra": now_iso,
+                    "thoi_luong_text": fee_info["thoi_luong_text"],
+                    "anh_vao": visitor.get("anh_vao"),
+                    "anh_ra": saved_out_path,
+                    "tien_thu": so_tien,
+                    "cong_thuc_text": fee_info["cong_thuc_text"],
+                    "phuong_thuc_thanh_toan": payment_method,
+                    "ma_nhan_vien_vao": visitor.get("ma_nhan_vien_vao"),
+                    "ma_nhan_vien_ra": staff_id,
+                    "ma_ca_lam_viec": shift_info["ma_ca_lam_viec"],
+                    "ca_lam_viec": ca_code,
+                    "barrier_status": "OPENED",
+                }
+
+        if pop_visitor_plate is not None:
+            self.state_store.pop_visitor_session(pop_visitor_plate)
+
+        self.file_logger.log_parking_history(
+            ma_luot_gui=exit_record["ma_luot_gui"],
+            loai_khach=exit_record["loai_khach"],
+            bien_so_xe=exit_record["bien_so_xe"],
+            ma_loai_xe=exit_record["ma_loai_xe"],
+            ma_khu_vuc=exit_record["ma_khu_vuc"],
+            ma_vi_tri=exit_record["ma_vi_tri"],
+            thoi_gian_vao=exit_record["thoi_gian_vao"],
+            thoi_gian_ra=exit_record["thoi_gian_ra"],
+            anh_vao=exit_record.get("anh_vao"),
+            anh_ra=exit_record.get("anh_ra"),
+            tien_thu=exit_record["tien_thu"],
+            ma_nhan_vien_vao=exit_record.get("ma_nhan_vien_vao"),
+            ma_nhan_vien_ra=exit_record.get("ma_nhan_vien_ra"),
+            trang_thai=ParkingHistoryStatus.DA_RA_BAI.value,
+            extra={
+                "phuong_thuc_thanh_toan": exit_record["phuong_thuc_thanh_toan"],
+                "ma_ca_lam_viec": exit_record["ma_ca_lam_viec"],
+                "ca_lam_viec": exit_record["ca_lam_viec"],
+                "ma_tham_chieu": exit_record.get("ma_tham_chieu") or "",
+                "cong_thuc_text": exit_record.get("cong_thuc_text") or "",
+                "ten_khu_vuc": exit_record.get("ten_khu_vuc") or "",
+                "ten_vi_tri": exit_record.get("ten_vi_tri") or "",
+                "ho_ten_chu_xe": exit_record.get("ho_ten_chu_xe") or "",
+                "ma_can_ho": exit_record.get("ma_can_ho") or "",
+            },
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GATE_OUT_EXIT",
+            doi_tuong="phuong_tien_ra_vao",
+            ma_doi_tuong=exit_record["bien_so_xe"],
+            gia_tri_moi={
+                "ma_luot_gui": exit_record["ma_luot_gui"],
+                "loai_khach": exit_record["loai_khach"],
+                "tien_thu": exit_record["tien_thu"],
+                "phuong_thuc_thanh_toan": exit_record["phuong_thuc_thanh_toan"],
+                "ma_ca_lam_viec": exit_record["ma_ca_lam_viec"],
+            },
+        )
+        self._broadcast_parking_state(
+            "gate_out",
+            {
+                "bien_so_xe": exit_record["bien_so_xe"],
+                "loai_khach": exit_record["loai_khach"],
+                "tien_thu": exit_record["tien_thu"],
+                "ma_khu_vuc": exit_record["ma_khu_vuc"],
+                "ma_vi_tri": exit_record["ma_vi_tri"],
+            },
+        )
+
+        return {
+            "exit": exit_record,
+            "message": (
+                f"Đã xác nhận thu {int(exit_record['tien_thu']):,} VNĐ và mở cổng ra cho xe {exit_record['bien_so_xe']}."
+                if exit_record["loai_khach"] == "vang_lai"
+                else f"Đã mở cổng ra cho xe cư dân {exit_record['bien_so_xe']} (Miễn phí lượt)."
+            ),
+        }
