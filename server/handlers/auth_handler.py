@@ -882,6 +882,284 @@ class AuthHRHandler:
             action_label="KICH_HOAT_TK_CU_DAN",
         )
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.3.6 - 1.3.10: QUẢN LÝ HỒ SƠ NHÂN VIÊN
+    # ==========================================================================
+    @staticmethod
+    def _role_for_position(chuc_vu: str) -> str:
+        pos = (chuc_vu or "").strip().lower()
+        if "quan_ly" in pos or "quản lý" in pos:
+            return Roles.QUAN_LY.value
+        return Roles.NHAN_VIEN.value
+
+    def _resolve_staff_account_id(self, payload: Dict[str, Any]) -> int:
+        if payload.get("ma_tai_khoan") is not None:
+            return int(payload["ma_tai_khoan"])
+        if payload.get("ma_nhan_vien") is not None:
+            row = self._db().fetch_one(
+                "SELECT ma_tai_khoan FROM nhan_vien WHERE ma_nhan_vien = %s",
+                (int(payload["ma_nhan_vien"]),),
+            )
+            if row:
+                return int(row["ma_tai_khoan"])
+        raise BusinessError("Không xác định được tài khoản nhân viên cần thao tác.")
+
+    def handle_create_staff(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.6: Thêm nhân viên / quản lý mới trong 1 transaction ACID."""
+        ma_nhan_vien_code = str(payload.get("ma_nhan_vien_code") or "").strip().upper()
+        ho_ten = str(payload.get("ho_ten") or "").strip()
+        so_cccd = str(payload.get("so_cccd") or "").strip()
+        so_dien_thoai = str(payload.get("so_dien_thoai") or "").strip()
+        email = str(payload.get("email") or "").strip().lower()
+        chuc_vu = str(payload.get("chuc_vu") or "nhan_vien_bai_xe").strip()
+        ten_dang_nhap = str(payload.get("ten_dang_nhap") or "").strip()
+        mat_khau = str(payload.get("mat_khau_ban_dau") or payload.get("mat_khau") or "")
+
+        if not ma_nhan_vien_code or not ho_ten or not ten_dang_nhap:
+            raise BusinessError("Vui lòng nhập đầy đủ mã nhân viên, họ tên và tên đăng nhập.")
+        if chuc_vu not in ("nhan_vien_bai_xe", "quan_ly_chung_cu"):
+            raise BusinessError("Chức vụ phải là `nhan_vien_bai_xe` hoặc `quan_ly_chung_cu`.")
+        if not validate_cccd(so_cccd):
+            raise BusinessError("Số CCCD/CMND phải gồm 9 hoặc 12 chữ số.")
+        if not validate_phone(so_dien_thoai):
+            raise BusinessError("Số điện thoại không đúng định dạng Việt Nam.")
+        if not validate_email(email):
+            raise BusinessError("Địa chỉ email không hợp lệ.")
+        if len(mat_khau) < 6:
+            raise BusinessError("Mật khẩu ban đầu phải có ít nhất 6 ký tự.")
+
+        vai_tro = self._role_for_position(chuc_vu)
+        pw_hash = hash_password(mat_khau)
+        db = self._db()
+
+        with db.transaction() as tx:
+            if tx.fetch_one("SELECT ma_tai_khoan FROM tai_khoan WHERE ten_dang_nhap = %s", (ten_dang_nhap,)):
+                raise BusinessError(f"Tên đăng nhập '{ten_dang_nhap}' đã tồn tại.")
+            if tx.fetch_one(
+                "SELECT ma_nhan_vien FROM nhan_vien WHERE ma_nhan_vien_code = %s",
+                (ma_nhan_vien_code,),
+            ):
+                raise BusinessError(f"Mã nhân viên '{ma_nhan_vien_code}' đã tồn tại.")
+            self._check_unique_contact(tx, so_cccd=so_cccd, email=email)
+
+            tk_row = tx.execute_returning(
+                """
+                INSERT INTO tai_khoan (ten_dang_nhap, mat_khau_bam, vai_tro, trang_thai)
+                VALUES (%s, %s, %s, %s)
+                RETURNING ma_tai_khoan, ten_dang_nhap, vai_tro, trang_thai, ngay_tao
+                """,
+                (ten_dang_nhap, pw_hash, vai_tro, AccountStatus.HOAT_DONG.value),
+            )
+            ma_tai_khoan = int(tk_row["ma_tai_khoan"])
+            nv_row = tx.execute_returning(
+                """
+                INSERT INTO nhan_vien (
+                    ma_tai_khoan, ma_nhan_vien_code, ho_ten, so_cccd, so_dien_thoai, email, chuc_vu
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING ma_nhan_vien, ma_tai_khoan, ma_nhan_vien_code, ho_ten, so_cccd, so_dien_thoai, email, chuc_vu
+                """,
+                (ma_tai_khoan, ma_nhan_vien_code, ho_ten, so_cccd, so_dien_thoai, email, chuc_vu),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="TAO_NHAN_VIEN",
+            doi_tuong="nhan_vien",
+            ma_doi_tuong=nv_row["ma_nhan_vien"],
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "ma_nhan_vien_code": ma_nhan_vien_code,
+                "ten_dang_nhap": ten_dang_nhap,
+                "vai_tro": vai_tro,
+                "chuc_vu": chuc_vu,
+            },
+        )
+        return {
+            "staff": {
+                **nv_row,
+                "ten_dang_nhap": ten_dang_nhap,
+                "vai_tro": vai_tro,
+                "trang_thai": AccountStatus.HOAT_DONG.value,
+            }
+        }
+
+    def handle_list_staff(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.7: Xem danh sách nhân viên lọc theo từ khóa, mã NV, chức vụ, trạng thái."""
+        keyword = str(payload.get("keyword") or payload.get("ho_ten") or "").strip()
+        ma_nhan_vien_code = str(payload.get("ma_nhan_vien_code") or "").strip()
+        chuc_vu = str(payload.get("chuc_vu") or "").strip()
+        trang_thai = str(payload.get("trang_thai") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(nv.ho_ten ILIKE %s OR nv.ma_nhan_vien_code ILIKE %s "
+                "OR tk.ten_dang_nhap ILIKE %s OR nv.email ILIKE %s OR nv.so_dien_thoai ILIKE %s)"
+            )
+            params.extend([like, like, like, like, like])
+        if ma_nhan_vien_code:
+            conditions.append("nv.ma_nhan_vien_code ILIKE %s")
+            params.append(f"%{ma_nhan_vien_code}%")
+        if chuc_vu:
+            conditions.append("nv.chuc_vu = %s")
+            params.append(chuc_vu)
+        if trang_thai:
+            conditions.append("tk.trang_thai = %s")
+            params.append(trang_thai)
+
+        where_sql = " AND ".join(conditions)
+        rows = self._db().fetch_all(
+            f"""
+            SELECT nv.ma_nhan_vien,
+                   nv.ma_tai_khoan,
+                   nv.ma_nhan_vien_code,
+                   nv.ho_ten,
+                   nv.so_cccd,
+                   nv.so_dien_thoai,
+                   nv.email,
+                   nv.chuc_vu,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   tk.trang_thai,
+                   tk.ly_do_khoa,
+                   tk.ngay_tao
+            FROM nhan_vien nv
+            JOIN tai_khoan tk ON tk.ma_tai_khoan = nv.ma_tai_khoan
+            WHERE {where_sql}
+            ORDER BY nv.ma_nhan_vien ASC
+            """,
+            tuple(params),
+        )
+        return {"total": len(rows), "items": rows}
+
+    def handle_update_staff(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.8: Sửa hồ sơ nhân viên và đồng bộ vai trò nếu đổi chức vụ."""
+        ma_nhan_vien = payload.get("ma_nhan_vien")
+        if ma_nhan_vien is None:
+            raise BusinessError("Thiếu `ma_nhan_vien` để cập nhật hồ sơ.")
+
+        db = self._db()
+        old_row = db.fetch_one(
+            """
+            SELECT nv.ma_nhan_vien, nv.ma_tai_khoan, nv.ma_nhan_vien_code, nv.ho_ten,
+                   nv.so_cccd, nv.so_dien_thoai, nv.email, nv.chuc_vu,
+                   tk.ten_dang_nhap, tk.vai_tro, tk.trang_thai
+            FROM nhan_vien nv
+            JOIN tai_khoan tk ON tk.ma_tai_khoan = nv.ma_tai_khoan
+            WHERE nv.ma_nhan_vien = %s
+            """,
+            (int(ma_nhan_vien),),
+        )
+        if not old_row:
+            raise BusinessError(f"Không tìm thấy nhân viên mã {ma_nhan_vien}.")
+
+        ho_ten = str(payload.get("ho_ten") if payload.get("ho_ten") is not None else old_row["ho_ten"]).strip()
+        so_cccd = str(payload.get("so_cccd") if payload.get("so_cccd") is not None else old_row["so_cccd"]).strip()
+        so_dien_thoai = str(
+            payload.get("so_dien_thoai") if payload.get("so_dien_thoai") is not None else old_row["so_dien_thoai"]
+        ).strip()
+        email = str(payload.get("email") if payload.get("email") is not None else old_row["email"]).strip().lower()
+        chuc_vu = str(payload.get("chuc_vu") if payload.get("chuc_vu") is not None else old_row["chuc_vu"]).strip()
+
+        if not ho_ten:
+            raise BusinessError("Họ tên nhân viên không được để trống.")
+        if chuc_vu not in ("nhan_vien_bai_xe", "quan_ly_chung_cu"):
+            raise BusinessError("Chức vụ phải là `nhan_vien_bai_xe` hoặc `quan_ly_chung_cu`.")
+        if not validate_cccd(so_cccd):
+            raise BusinessError("Số CCCD/CMND phải gồm 9 hoặc 12 chữ số.")
+        if not validate_phone(so_dien_thoai):
+            raise BusinessError("Số điện thoại không đúng định dạng Việt Nam.")
+        if not validate_email(email):
+            raise BusinessError("Địa chỉ email không hợp lệ.")
+
+        ma_tai_khoan = int(old_row["ma_tai_khoan"])
+        new_role = self._role_for_position(chuc_vu)
+        self._check_unique_contact(db, so_cccd=so_cccd, email=email, exclude_tai_khoan=ma_tai_khoan)
+
+        with db.transaction() as tx:
+            updated = tx.execute_returning(
+                """
+                UPDATE nhan_vien
+                SET ho_ten = %s, so_cccd = %s, so_dien_thoai = %s, email = %s, chuc_vu = %s
+                WHERE ma_nhan_vien = %s
+                RETURNING ma_nhan_vien, ma_tai_khoan, ma_nhan_vien_code, ho_ten, so_cccd, so_dien_thoai, email, chuc_vu
+                """,
+                (ho_ten, so_cccd, so_dien_thoai, email, chuc_vu, int(ma_nhan_vien)),
+            )
+            tx.execute(
+                "UPDATE tai_khoan SET vai_tro = %s WHERE ma_tai_khoan = %s",
+                (new_role, ma_tai_khoan),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="SUA_NHAN_VIEN",
+            doi_tuong="nhan_vien",
+            ma_doi_tuong=int(ma_nhan_vien),
+            gia_tri_cu={
+                "ho_ten": old_row["ho_ten"],
+                "so_cccd": old_row["so_cccd"],
+                "so_dien_thoai": old_row["so_dien_thoai"],
+                "email": old_row["email"],
+                "chuc_vu": old_row["chuc_vu"],
+            },
+            gia_tri_moi={
+                "ho_ten": ho_ten,
+                "so_cccd": so_cccd,
+                "so_dien_thoai": so_dien_thoai,
+                "email": email,
+                "chuc_vu": chuc_vu,
+            },
+        )
+        return {
+            "staff": {
+                **updated,
+                "ten_dang_nhap": old_row["ten_dang_nhap"],
+                "vai_tro": new_role,
+                "trang_thai": old_row["trang_thai"],
+            }
+        }
+
+    def handle_deactivate_staff(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.9: Ngừng hoạt động tài khoản nhân viên và thu hồi phiên kết nối."""
+        ma_tk = self._resolve_staff_account_id(payload)
+        return self._set_account_status(
+            session,
+            ma_tai_khoan=ma_tk,
+            new_status=AccountStatus.TAM_KHOA.value,
+            ly_do_khoa=str(payload.get("ly_do_khoa") or payload.get("ly_do") or ""),
+            expected_roles=(Roles.NHAN_VIEN.value, Roles.QUAN_LY.value),
+            action_label="KHOA_TK_NHAN_VIEN",
+        )
+
+    def handle_activate_staff(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.10: Kích hoạt lại tài khoản nhân viên."""
+        ma_tk = self._resolve_staff_account_id(payload)
+        return self._set_account_status(
+            session,
+            ma_tai_khoan=ma_tk,
+            new_status=AccountStatus.HOAT_DONG.value,
+            ly_do_khoa=None,
+            expected_roles=(Roles.NHAN_VIEN.value, Roles.QUAN_LY.value),
+            action_label="KICH_HOAT_TK_NHAN_VIEN",
+        )
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -991,6 +1269,41 @@ def register_auth_hr_routes(
     router.register(
         Actions.HR_ACTIVATE_RESIDENT,
         handler.handle_activate_resident,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_CREATE_STAFF,
+        handler.handle_create_staff,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_LIST_STAFF,
+        handler.handle_list_staff,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_UPDATE_STAFF,
+        handler.handle_update_staff,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_DEACTIVATE_STAFF,
+        handler.handle_deactivate_staff,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_ACTIVATE_STAFF,
+        handler.handle_activate_staff,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
         require_auth=True,
