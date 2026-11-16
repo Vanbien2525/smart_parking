@@ -26,7 +26,9 @@ from client.ui.admin.admin_views import (
     AdminReadOnlyWrapper,
     AdminSessionsView,
 )
+from client.ui.admin.admin_window import AdminWindow
 from client.ui.manager.dashboard_view import DashboardView
+from client.ui.manager.manager_window import ManagerWindow
 from server.config import ServerConfig
 from server.core.file_logger import FileLogger
 from server.core.otp_service import OTPService
@@ -459,6 +461,30 @@ class TestLeaderCore(unittest.TestCase):
             client.disconnect()
             self.assertLess(elapsed, 2.0)
             self.assertFalse(thread.is_alive())
+
+    def test_10_separate_manager_and_admin_windows(self) -> None:
+        """Kiểm tra cửa sổ Quản lý và Admin tách biệt hoàn toàn để tiện phát triển."""
+        _app = QApplication.instance() or QApplication([])
+
+        manager_win = ManagerWindow()
+        admin_win = AdminWindow()
+
+        manager_keys = manager_win.page_keys()
+        admin_keys = admin_win.page_keys()
+
+        self.assertIn("1.1_dashboard", manager_keys)
+        self.assertFalse(any(k.startswith("4.") for k in manager_keys))
+        self.assertFalse(manager_win.dashboard_view.read_only)
+
+        for expected_admin_key in ("4.2_accounts", "4.3_sessions", "4.4_logs", "4.5_dashboard_ro"):
+            self.assertIn(expected_admin_key, admin_keys)
+        self.assertFalse(any(k.startswith("1.") for k in admin_keys))
+        self.assertTrue(admin_win.dashboard_readonly_view.child_widget.read_only)
+
+        manager_win.select_page("1.3_staff_resident")
+        self.assertIn("1.3", manager_win.lbl_topbar_title.text())
+        admin_win.select_page("4.4_logs")
+        self.assertIn("4.4", admin_win.lbl_topbar_title.text())
 
 
 if __name__ == "__main__":
