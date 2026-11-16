@@ -120,6 +120,20 @@ def _register_available_handlers(ctx: ServerContext) -> None:
     except ImportError:
         pass
 
+    try:
+        from server.handlers.gate_handler import register_gate_routes
+
+        register_gate_routes(
+            ctx.router,
+            file_logger=ctx.file_logger,
+            state_store=ctx.state_store,
+            session_manager=ctx.session_manager,
+            gates_in_dir=ctx.config.gates_in_dir,
+            gates_out_dir=ctx.config.gates_out_dir,
+        )
+    except ImportError:
+        pass
+
 
 def create_socket_server(
     config: Optional[ServerConfig] = None,

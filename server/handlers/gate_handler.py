@@ -1551,3 +1551,247 @@ class GateHandler:
                 f"Tổng bàn giao: {int(target_shift['tong_doanh_thu_chot_ca']):,} VNĐ."
             ),
         }
+
+    # ==========================================================================
+    # NHÓM 2.5.1 – 2.5.3: TRA CỨU PHƯƠNG TIỆN TẠI CHỐT BẢO VỆ
+    # ==========================================================================
+    @staticmethod
+    def _plate_matches_query(plate: str, query: str) -> bool:
+        if not query:
+            return True
+        q_raw = query.strip().upper()
+        p_raw = str(plate or "").strip().upper()
+        if q_raw in p_raw:
+            return True
+        q_compact = "".join(ch for ch in q_raw if ch.isalnum())
+        p_compact = "".join(ch for ch in p_raw if ch.isalnum())
+        return bool(q_compact and q_compact in p_compact)
+
+    def _build_plate_history_map(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Gộp lịch sử parking_history_*.jsonl theo `ma_luot_gui` và nhóm theo biển số."""
+        raw = self.file_logger.query_logs("parking_history", limit=500)
+        merged: Dict[str, Dict[str, Any]] = {}
+        for rec in reversed(raw):
+            sid = str(rec.get("ma_luot_gui") or "").strip()
+            if not sid:
+                sid = f"AUTO-{rec.get('bien_so_xe', '')}-{rec.get('timestamp', '')}"
+            existing = merged.get(sid, {})
+            combined = dict(existing)
+            for k, v in rec.items():
+                if v not in (None, "") or k not in combined:
+                    combined[k] = v
+            merged[sid] = combined
+
+        by_plate: Dict[str, List[Dict[str, Any]]] = {}
+        for item in merged.values():
+            plate = normalize_plate(str(item.get("bien_so_xe") or ""))
+            if not plate:
+                continue
+            by_plate.setdefault(plate, []).append(item)
+
+        for plate_list in by_plate.values():
+            plate_list.sort(
+                key=lambda x: str(x.get("thoi_gian_vao") or x.get("timestamp") or ""),
+                reverse=True,
+            )
+        return by_plate
+
+    def handle_gate_lookup_vehicle(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.5.1–2.5.3: Tra cứu biển số, trạng thái trong/ngoài bãi và lịch sử ảnh cổng vào/ra."""
+        self._ensure_staff_role(session)
+
+        search_plate = str(
+            payload.get("search_plate") or payload.get("bien_so") or payload.get("keyword") or ""
+        ).strip()
+        trang_thai_filter = str(payload.get("trang_thai_filter") or "all").strip().lower()
+        loai_khach_filter = str(payload.get("loai_khach_filter") or "all").strip().lower()
+        include_images = bool(payload.get("include_images", True))
+        limit = max(1, min(200, int(payload.get("limit") or 100)))
+
+        db = self._db()
+        history_by_plate = self._build_plate_history_map()
+
+        results: List[Dict[str, Any]] = []
+        seen_plates: set[str] = set()
+
+        # 1. Xe cư dân trong CSDL
+        if loai_khach_filter in ("all", "cu_dan"):
+            resident_rows = db.fetch_all(
+                """
+                SELECT pt.ma_phuong_tien, pt.bien_so_xe, pt.ma_loai_xe,
+                       pt.ten_hang_dong_xe, pt.mau_xe, pt.trang_thai_xe,
+                       cd.ho_ten, cd.so_dien_thoai, cd.ma_can_ho,
+                       ql.dang_trong_bai, ql.thoi_gian_vao, ql.thoi_gian_ra,
+                       ql.ma_vi_tri_co_dinh, ql.ma_khu_vuc_phan_cong,
+                       vt.ten_vi_tri AS ten_vi_tri_co_dinh,
+                       vt.ma_khu_vuc AS ma_khu_vuc_vi_tri,
+                       kv.ten_khu_vuc
+                FROM phuong_tien pt
+                JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+                LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_phuong_tien = pt.ma_phuong_tien
+                LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = ql.ma_vi_tri_co_dinh
+                LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = COALESCE(ql.ma_khu_vuc_phan_cong, vt.ma_khu_vuc)
+                WHERE pt.trang_thai_xe = %s
+                ORDER BY COALESCE(ql.dang_trong_bai, FALSE) DESC, pt.bien_so_xe ASC
+                """,
+                (VehicleStatus.DANG_HOAT_DONG.value,),
+            )
+            for r in resident_rows:
+                plate = normalize_plate(str(r.get("bien_so_xe") or ""))
+                if not plate or not self._plate_matches_query(plate, search_plate):
+                    continue
+                in_yard = bool(r.get("dang_trong_bai"))
+                status_code = "dang_do_trong_bai" if in_yard else "ngoai_bai"
+                if trang_thai_filter != "all" and status_code != trang_thai_filter:
+                    continue
+
+                seen_plates.add(plate)
+                ma_khu_vuc = r.get("ma_khu_vuc_phan_cong") or r.get("ma_khu_vuc_vi_tri") or ""
+                results.append(
+                    {
+                        "bien_so_xe": plate,
+                        "loai_khach": "cu_dan",
+                        "phan_loai_text": f"Cư dân · Căn hộ {r.get('ma_can_ho') or '-'}",
+                        "ma_loai_xe": str(r.get("ma_loai_xe") or VehicleTypes.O_TO.value),
+                        "ten_hang_dong_xe": r.get("ten_hang_dong_xe") or "",
+                        "mau_xe": r.get("mau_xe") or "",
+                        "ho_ten_chu_xe": r.get("ho_ten") or "",
+                        "so_dien_thoai": r.get("so_dien_thoai") or "",
+                        "ma_can_ho": r.get("ma_can_ho") or "",
+                        "dang_trong_bai": in_yard,
+                        "trang_thai_hien_tai": status_code,
+                        "ma_vi_tri": r.get("ma_vi_tri_co_dinh"),
+                        "ten_vi_tri": r.get("ten_vi_tri_co_dinh") or r.get("ma_vi_tri_co_dinh") or "",
+                        "ma_khu_vuc": ma_khu_vuc,
+                        "ten_khu_vuc": r.get("ten_khu_vuc") or ma_khu_vuc,
+                        "thoi_gian_vao_gan_nhat": str(r.get("thoi_gian_vao") or ""),
+                        "thoi_gian_ra_gan_nhat": str(r.get("thoi_gian_ra") or ""),
+                    }
+                )
+
+        # 2. Xe vãng lai đang gửi trong bãi (StateStore)
+        if loai_khach_filter in ("all", "vang_lai") and trang_thai_filter in ("all", "dang_do_trong_bai"):
+            for v in self.state_store.list_visitor_sessions():
+                plate = normalize_plate(str(v.get("bien_so_xe") or ""))
+                if not plate or plate in seen_plates or not self._plate_matches_query(plate, search_plate):
+                    continue
+                seen_plates.add(plate)
+                results.append(
+                    {
+                        "bien_so_xe": plate,
+                        "loai_khach": "vang_lai",
+                        "phan_loai_text": "Khách vãng lai (Đang gửi)",
+                        "ma_loai_xe": str(v.get("ma_loai_xe") or VehicleTypes.O_TO.value),
+                        "ten_hang_dong_xe": "Khách vãng lai",
+                        "mau_xe": "",
+                        "ho_ten_chu_xe": "Khách vãng lai",
+                        "so_dien_thoai": "",
+                        "ma_can_ho": "",
+                        "dang_trong_bai": True,
+                        "trang_thai_hien_tai": "dang_do_trong_bai",
+                        "ma_vi_tri": v.get("ma_vi_tri"),
+                        "ten_vi_tri": v.get("ten_vi_tri") or v.get("ma_vi_tri") or "",
+                        "ma_khu_vuc": v.get("ma_khu_vuc") or "",
+                        "ten_khu_vuc": v.get("ten_khu_vuc") or v.get("ma_khu_vuc") or "",
+                        "thoi_gian_vao_gan_nhat": str(v.get("thoi_gian_vao") or ""),
+                        "thoi_gian_ra_gan_nhat": "",
+                    }
+                )
+
+        # 3. Xe vãng lai đã ra bãi trước đó (từ parking_history)
+        if loai_khach_filter in ("all", "vang_lai") and trang_thai_filter in ("all", "ngoai_bai"):
+            for plate, hist_list in history_by_plate.items():
+                if plate in seen_plates or not self._plate_matches_query(plate, search_plate):
+                    continue
+                latest = hist_list[0]
+                if str(latest.get("loai_khach") or "") != "vang_lai":
+                    continue
+                seen_plates.add(plate)
+                results.append(
+                    {
+                        "bien_so_xe": plate,
+                        "loai_khach": "vang_lai",
+                        "phan_loai_text": "Khách vãng lai (Đã ra bãi)",
+                        "ma_loai_xe": str(latest.get("ma_loai_xe") or VehicleTypes.O_TO.value),
+                        "ten_hang_dong_xe": "Khách vãng lai",
+                        "mau_xe": "",
+                        "ho_ten_chu_xe": "Khách vãng lai",
+                        "so_dien_thoai": "",
+                        "ma_can_ho": "",
+                        "dang_trong_bai": False,
+                        "trang_thai_hien_tai": "ngoai_bai",
+                        "ma_vi_tri": latest.get("ma_vi_tri"),
+                        "ten_vi_tri": latest.get("ten_vi_tri") or latest.get("ma_vi_tri") or "",
+                        "ma_khu_vuc": latest.get("ma_khu_vuc") or "",
+                        "ten_khu_vuc": latest.get("ten_khu_vuc") or latest.get("ma_khu_vuc") or "",
+                        "thoi_gian_vao_gan_nhat": str(latest.get("thoi_gian_vao") or ""),
+                        "thoi_gian_ra_gan_nhat": str(latest.get("thoi_gian_ra") or ""),
+                    }
+                )
+
+        # Đính kèm lịch sử vào/ra gần nhất (tối đa 10 lượt/xe) kèm ảnh cổng vào/ra Base64
+        results = results[:limit]
+        for item in results:
+            plate = item["bien_so_xe"]
+            turns = []
+            for h in history_by_plate.get(plate, [])[:10]:
+                turn_data = {
+                    "ma_luot_gui": h.get("ma_luot_gui") or "",
+                    "loai_khach": h.get("loai_khach") or item["loai_khach"],
+                    "ma_khu_vuc": h.get("ma_khu_vuc") or "",
+                    "ten_khu_vuc": h.get("ten_khu_vuc") or h.get("ma_khu_vuc") or "",
+                    "ma_vi_tri": h.get("ma_vi_tri") or "",
+                    "ten_vi_tri": h.get("ten_vi_tri") or h.get("ma_vi_tri") or "",
+                    "thoi_gian_vao": h.get("thoi_gian_vao") or "",
+                    "thoi_gian_ra": h.get("thoi_gian_ra") or "",
+                    "trang_thai": h.get("trang_thai") or "",
+                    "tien_thu": float(h.get("tien_thu") or 0),
+                    "phuong_thuc_thanh_toan": h.get("phuong_thuc_thanh_toan") or "",
+                    "anh_vao": h.get("anh_vao") or "",
+                    "anh_ra": h.get("anh_ra") or "",
+                }
+                if include_images:
+                    turn_data["anh_vao_base64"] = self._load_image_base64(h.get("anh_vao"))
+                    turn_data["anh_ra_base64"] = self._load_image_base64(h.get("anh_ra"))
+                turns.append(turn_data)
+            item["history"] = turns
+
+        return {
+            "total": len(results),
+            "items": results,
+        }
+
+
+def register_gate_routes(
+    router: Router,
+    file_logger: FileLogger,
+    state_store: StateStore,
+    session_manager: Optional[SessionManager] = None,
+    db_provider: Any = None,
+    gates_in_dir: Optional[Path] = None,
+    gates_out_dir: Optional[Path] = None,
+    shift_state_file: Optional[Path] = None,
+) -> GateHandler:
+    """Đăng ký 7 action kiểm soát cổng vào/ra, doanh thu ca & tra cứu của Ny lên Router."""
+    handler = GateHandler(
+        file_logger=file_logger,
+        state_store=state_store,
+        session_manager=session_manager,
+        db_provider=db_provider,
+        gates_in_dir=gates_in_dir,
+        gates_out_dir=gates_out_dir,
+        shift_state_file=shift_state_file,
+    )
+    staff_roles = (Roles.NHAN_VIEN.value, Roles.QUAN_LY.value)
+
+    router.register(Actions.GATE_IN_CHECK, handler.handle_gate_in_check, allowed_roles=staff_roles, is_mutation=False)
+    router.register(Actions.GATE_IN_CONFIRM, handler.handle_gate_in_confirm, allowed_roles=staff_roles, is_mutation=True)
+    router.register(Actions.GATE_OUT_CHECK, handler.handle_gate_out_check, allowed_roles=staff_roles, is_mutation=False)
+    router.register(Actions.GATE_OUT_CONFIRM, handler.handle_gate_out_confirm, allowed_roles=staff_roles, is_mutation=True)
+    router.register(Actions.GATE_LOOKUP_VEHICLE, handler.handle_gate_lookup_vehicle, allowed_roles=staff_roles, is_mutation=False)
+    router.register(Actions.SHIFT_GET_REVENUE, handler.handle_shift_get_revenue, allowed_roles=staff_roles, is_mutation=False)
+    router.register(Actions.SHIFT_CLOSE, handler.handle_shift_close, allowed_roles=staff_roles, is_mutation=True)
+
+    return handler
