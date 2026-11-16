@@ -10,6 +10,7 @@ Bao gồm đầy đủ 11 chức năng lá:
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import uuid
 
 from server.config import DEFAULT_CONFIG, ensure_storage_dirs
 from server.core.file_logger import FileLogger
@@ -17,14 +18,15 @@ from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession, SessionManager
 from server.core.state_store import StateStore
 from shared.constants import (
+    ParkingHistoryStatus,
     Roles,
     SlotStatus,
     VehicleStatus,
     VehicleTypes,
     ZoneStatus,
 )
-from shared.protocol import Actions
-from shared.validators import normalize_plate, validate_plate
+from shared.protocol import Actions, PushEvents
+from shared.validators import normalize_plate, save_base64_image, validate_plate
 
 
 def _resolve_db(db_provider: Any = None) -> Any:
@@ -269,4 +271,383 @@ class GateHandler:
             "available_car_slots": available_car_slots,
             "available_moto_zones": available_moto_zones,
             "ghi_chu": "Khách vãng lai (Ticketless) — định danh trực tiếp bằng biển số xe.",
+        }
+
+    def _save_gate_image(
+        self,
+        b64_str: Optional[str],
+        dest_dir: Path,
+        prefix: str,
+    ) -> Optional[str]:
+        """Lưu ảnh chụp cổng vào/ra dạng Base64 xuống đĩa và trả về đường dẫn lưu log."""
+        if not b64_str or not str(b64_str).strip():
+            return None
+        try:
+            saved_path = Path(save_base64_image(str(b64_str), dest_dir, prefix=prefix))
+        except ValueError as exc:
+            raise BusinessError(f"Ảnh chụp cổng không hợp lệ: {exc}") from exc
+
+        try:
+            rel = saved_path.resolve().relative_to(DEFAULT_CONFIG.base_dir.resolve())
+            return str(rel).replace("\\", "/")
+        except ValueError:
+            return str(saved_path)
+
+    def _broadcast_parking_state(self, reason: str, data: Optional[Dict[str, Any]] = None) -> None:
+        if self.session_manager is None:
+            return
+        payload = {"reason": reason, "timestamp": datetime.now().isoformat(timespec="seconds")}
+        if data:
+            payload.update(data)
+        try:
+            self.session_manager.push_to_roles(
+                [Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.ADMIN.value],
+                PushEvents.PARKING_STATE_CHANGED,
+                payload,
+            )
+        except Exception:
+            pass
+
+    # ==========================================================================
+    # NHÓM 2.2.3.1 & 2.2.3.2 (WORKFLOW 03): XÁC NHẬN CHO XE VÀO BÃI TICKETLESS
+    # ==========================================================================
+    def handle_gate_in_confirm(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.2.3.1 (Cư dân) & 2.2.3.2 (Vãng lai Ticketless): Ghi nhận xe vào bãi ACID."""
+        self._ensure_staff_role(session)
+
+        raw_plate = str(payload.get("bien_so") or payload.get("bien_so_xe") or "").strip()
+        if not raw_plate:
+            raise BusinessError("Thiếu biển số xe để xác nhận mở cổng vào.")
+
+        ok_plate, valid_or_err = validate_plate(raw_plate)
+        if not ok_plate:
+            raise BusinessError(valid_or_err)
+        normalized_plate = valid_or_err
+
+        gate_image_b64 = payload.get("gate_image_base64") or payload.get("anh_vao_base64")
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat(timespec="seconds")
+        ma_luot_gui = f"LG-{now_dt.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+        db = self._db()
+        saved_in_path: Optional[str] = None
+        result_record: Dict[str, Any] = {}
+
+        with db.transaction() as tx:
+            staff_id = self._resolve_staff_id(tx, session)
+            in_yard = self._check_anti_passback(tx, normalized_plate)
+            if in_yard is not None:
+                raise BusinessError(
+                    f"Biển số {normalized_plate} đang ở trong bãi từ lúc {in_yard.get('thoi_gian_vao')}! "
+                    "Không thể mở cổng vào trùng lặp."
+                )
+
+            # Kiểm tra thực tế trong bảng phuong_tien để đảm bảo phân nhánh chuẩn
+            resident_car = tx.fetch_one(
+                """
+                SELECT pt.ma_phuong_tien, pt.ma_cu_dan, pt.ma_loai_xe, pt.bien_so_xe,
+                       cd.ho_ten, cd.ma_can_ho,
+                       ql.ma_quan_ly_xe, ql.ma_vi_tri_co_dinh, ql.ma_khu_vuc_phan_cong,
+                       vt.ten_vi_tri AS ten_vi_tri_co_dinh,
+                       vt.ma_khu_vuc AS ma_khu_vuc_vi_tri,
+                       kv.ten_khu_vuc
+                FROM phuong_tien pt
+                JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+                LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_phuong_tien = pt.ma_phuong_tien
+                LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = ql.ma_vi_tri_co_dinh
+                LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = COALESCE(ql.ma_khu_vuc_phan_cong, vt.ma_khu_vuc)
+                WHERE pt.bien_so_xe = %s AND pt.trang_thai_xe = %s
+                """,
+                (normalized_plate, VehicleStatus.DANG_HOAT_DONG.value),
+            )
+
+            if resident_car:
+                # Nhánh 2.2.3.1: Xe đã đăng ký của cư dân
+                ma_pt = int(resident_car["ma_phuong_tien"])
+                ma_loai_xe = str(resident_car.get("ma_loai_xe") or VehicleTypes.O_TO.value)
+                ma_vi_tri = resident_car.get("ma_vi_tri_co_dinh")
+                ma_khu_vuc = (
+                    resident_car.get("ma_khu_vuc_phan_cong")
+                    or resident_car.get("ma_khu_vuc_vi_tri")
+                    or ""
+                )
+                ten_khu_vuc = resident_car.get("ten_khu_vuc") or ma_khu_vuc
+
+                if resident_car.get("ma_quan_ly_xe") is None:
+                    raise BusinessError(
+                        f"Xe cư dân {normalized_plate} chưa được phân bổ vị trí/khu vực hợp lệ trong hệ thống."
+                    )
+
+                if ma_khu_vuc:
+                    zone_row = tx.fetch_one(
+                        """
+                        SELECT ma_khu_vuc, tong_so_cho, so_xe_dang_gui, trang_thai_khu_vuc
+                        FROM khu_vuc
+                        WHERE ma_khu_vuc = %s
+                        """,
+                        (ma_khu_vuc,),
+                    )
+                    if not zone_row or zone_row.get("trang_thai_khu_vuc") != ZoneStatus.HOAT_DONG.value:
+                        raise BusinessError(f"Khu vực '{ma_khu_vuc}' hiện không hoạt động.")
+
+                saved_in_path = self._save_gate_image(
+                    gate_image_b64, self.gates_in_dir, f"in_{normalized_plate}"
+                )
+
+                tx.execute(
+                    """
+                    UPDATE quan_ly_phuong_tien_ra_vao
+                    SET dang_trong_bai = TRUE,
+                        thoi_gian_vao = %s
+                    WHERE ma_phuong_tien = %s
+                    """,
+                    (now_dt, ma_pt),
+                )
+
+                if ma_loai_xe == VehicleTypes.O_TO.value and ma_vi_tri:
+                    tx.execute(
+                        """
+                        UPDATE vi_tri_do
+                        SET trang_thai_vi_tri = %s,
+                            thoi_gian_cap_nhat = %s
+                        WHERE ma_vi_tri = %s
+                        """,
+                        (SlotStatus.DANG_CO_XE.value, now_dt, ma_vi_tri),
+                    )
+
+                if ma_khu_vuc:
+                    tx.execute(
+                        """
+                        UPDATE khu_vuc
+                        SET so_xe_dang_gui = LEAST(tong_so_cho, so_xe_dang_gui + 1)
+                        WHERE ma_khu_vuc = %s
+                        """,
+                        (ma_khu_vuc,),
+                    )
+
+                result_record = {
+                    "ma_luot_gui": ma_luot_gui,
+                    "loai_khach": "cu_dan",
+                    "bien_so_xe": normalized_plate,
+                    "ma_loai_xe": ma_loai_xe,
+                    "ma_phuong_tien": ma_pt,
+                    "ma_can_ho": resident_car.get("ma_can_ho") or "",
+                    "ho_ten_chu_xe": resident_car.get("ho_ten") or "",
+                    "ma_vi_tri": ma_vi_tri,
+                    "ten_vi_tri": resident_car.get("ten_vi_tri_co_dinh") or ma_vi_tri or "",
+                    "ma_khu_vuc": ma_khu_vuc,
+                    "ten_khu_vuc": ten_khu_vuc,
+                    "thoi_gian_vao": now_iso,
+                    "anh_vao": saved_in_path,
+                    "ma_nhan_vien_vao": staff_id,
+                    "barrier_status": "OPENED",
+                }
+            else:
+                # Nhánh 2.2.3.2: Xe vãng lai (Ticketless)
+                ma_loai_xe = normalize_vehicle_type_code(
+                    payload.get("ma_loai_xe") or payload.get("loai_xe"),
+                    normalized_plate,
+                )
+                req_slot = str(payload.get("ma_vi_tri") or "").strip() or None
+                req_zone = str(payload.get("ma_khu_vuc") or "").strip() or None
+                ten_vi_tri = ""
+                ten_khu_vuc = ""
+
+                if ma_loai_xe == VehicleTypes.O_TO.value:
+                    if req_slot:
+                        slot_row = tx.fetch_one(
+                            """
+                            SELECT vt.ma_vi_tri, vt.ten_vi_tri, vt.ma_khu_vuc, vt.trang_thai_vi_tri,
+                                   kv.ten_khu_vuc, kv.ma_loai_xe, kv.trang_thai_khu_vuc,
+                                   kv.tong_so_cho, kv.so_xe_dang_gui
+                            FROM vi_tri_do vt
+                            JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+                            WHERE vt.ma_vi_tri = %s
+                            """,
+                            (req_slot,),
+                        )
+                    else:
+                        slot_row = tx.fetch_one(
+                            """
+                            SELECT vt.ma_vi_tri, vt.ten_vi_tri, vt.ma_khu_vuc, vt.trang_thai_vi_tri,
+                                   kv.ten_khu_vuc, kv.ma_loai_xe, kv.trang_thai_khu_vuc,
+                                   kv.tong_so_cho, kv.so_xe_dang_gui
+                            FROM vi_tri_do vt
+                            JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+                            WHERE kv.ma_loai_xe = %s
+                              AND kv.trang_thai_khu_vuc = %s
+                              AND vt.trang_thai_vi_tri = %s
+                              AND (kv.tong_so_cho - kv.so_xe_dang_gui) > 0
+                            ORDER BY CASE WHEN vt.nhom_vi_tri = 'vi_tri_vang_lai' THEN 0 ELSE 1 END,
+                                     vt.ma_vi_tri ASC
+                            LIMIT 1
+                            """,
+                            (
+                                VehicleTypes.O_TO.value,
+                                ZoneStatus.HOAT_DONG.value,
+                                SlotStatus.TRONG.value,
+                            ),
+                        )
+
+                    if not slot_row:
+                        raise BusinessError("Hiện không còn ô đỗ ô tô trống cho khách vãng lai!")
+                    if slot_row.get("ma_loai_xe") != VehicleTypes.O_TO.value:
+                        raise BusinessError(f"Ô đỗ '{slot_row['ma_vi_tri']}' không dành cho Ô tô.")
+                    if slot_row.get("trang_thai_khu_vuc") != ZoneStatus.HOAT_DONG.value:
+                        raise BusinessError(f"Khu vực '{slot_row['ma_khu_vuc']}' hiện đang ngừng sử dụng.")
+                    if slot_row.get("trang_thai_vi_tri") != SlotStatus.TRONG.value:
+                        raise BusinessError(
+                            f"Ô đỗ '{slot_row['ma_vi_tri']}' không còn trống (trạng thái: {slot_row.get('trang_thai_vi_tri')})."
+                        )
+                    if int(slot_row.get("so_xe_dang_gui") or 0) >= int(slot_row.get("tong_so_cho") or 0):
+                        raise BusinessError(f"Khu vực '{slot_row['ma_khu_vuc']}' đã đầy chỗ.")
+
+                    ma_vi_tri = str(slot_row["ma_vi_tri"])
+                    ten_vi_tri = str(slot_row.get("ten_vi_tri") or ma_vi_tri)
+                    ma_khu_vuc = str(slot_row["ma_khu_vuc"])
+                    ten_khu_vuc = str(slot_row.get("ten_khu_vuc") or ma_khu_vuc)
+
+                    updated_slots = tx.execute(
+                        """
+                        UPDATE vi_tri_do
+                        SET trang_thai_vi_tri = %s,
+                            thoi_gian_cap_nhat = %s
+                        WHERE ma_vi_tri = %s AND trang_thai_vi_tri = %s
+                        """,
+                        (SlotStatus.DANG_CO_XE.value, now_dt, ma_vi_tri, SlotStatus.TRONG.value),
+                    )
+                    if updated_slots <= 0:
+                        raise BusinessError(f"Ô đỗ '{ma_vi_tri}' vừa được xe khác chiếm chỗ.")
+                else:
+                    # Xe máy vãng lai: phân theo khu vực xe máy còn chỗ
+                    if req_zone:
+                        zone_row = tx.fetch_one(
+                            """
+                            SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe,
+                                   tong_so_cho, so_xe_dang_gui, trang_thai_khu_vuc
+                            FROM khu_vuc
+                            WHERE ma_khu_vuc = %s
+                            """,
+                            (req_zone,),
+                        )
+                    else:
+                        zone_row = tx.fetch_one(
+                            """
+                            SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe,
+                                   tong_so_cho, so_xe_dang_gui, trang_thai_khu_vuc
+                            FROM khu_vuc
+                            WHERE ma_loai_xe = %s
+                              AND trang_thai_khu_vuc = %s
+                              AND (tong_so_cho - so_xe_dang_gui) > 0
+                            ORDER BY ma_khu_vuc ASC
+                            LIMIT 1
+                            """,
+                            (VehicleTypes.XE_MAY.value, ZoneStatus.HOAT_DONG.value),
+                        )
+
+                    if not zone_row:
+                        raise BusinessError("Hiện không còn khu vực xe máy còn chỗ cho khách vãng lai!")
+                    if zone_row.get("ma_loai_xe") != VehicleTypes.XE_MAY.value:
+                        raise BusinessError(f"Khu vực '{zone_row['ma_khu_vuc']}' không dành cho Xe máy.")
+                    if zone_row.get("trang_thai_khu_vuc") != ZoneStatus.HOAT_DONG.value:
+                        raise BusinessError(f"Khu vực '{zone_row['ma_khu_vuc']}' đang ngừng sử dụng.")
+                    if int(zone_row.get("so_xe_dang_gui") or 0) >= int(zone_row.get("tong_so_cho") or 0):
+                        raise BusinessError(f"Khu vực '{zone_row['ma_khu_vuc']}' đã hết chỗ trống.")
+
+                    ma_vi_tri = None
+                    ma_khu_vuc = str(zone_row["ma_khu_vuc"])
+                    ten_khu_vuc = str(zone_row.get("ten_khu_vuc") or ma_khu_vuc)
+
+                updated_zones = tx.execute(
+                    """
+                    UPDATE khu_vuc
+                    SET so_xe_dang_gui = so_xe_dang_gui + 1
+                    WHERE ma_khu_vuc = %s AND so_xe_dang_gui < tong_so_cho
+                    """,
+                    (ma_khu_vuc,),
+                )
+                if updated_zones <= 0:
+                    raise BusinessError(f"Khu vực '{ma_khu_vuc}' đã đầy sức chứa.")
+
+                saved_in_path = self._save_gate_image(
+                    gate_image_b64, self.gates_in_dir, f"in_{normalized_plate}"
+                )
+
+                result_record = {
+                    "ma_luot_gui": ma_luot_gui,
+                    "loai_khach": "vang_lai",
+                    "bien_so_xe": normalized_plate,
+                    "ma_loai_xe": ma_loai_xe,
+                    "ma_vi_tri": ma_vi_tri,
+                    "ten_vi_tri": ten_vi_tri,
+                    "ma_khu_vuc": ma_khu_vuc,
+                    "ten_khu_vuc": ten_khu_vuc,
+                    "thoi_gian_vao": now_iso,
+                    "anh_vao": saved_in_path,
+                    "ma_nhan_vien_vao": staff_id,
+                    "barrier_status": "OPENED",
+                }
+
+        # Sau khi COMMIT PostgreSQL thành công: lưu StateStore (nếu vãng lai) & FileLogger
+        if result_record["loai_khach"] == "vang_lai":
+            self.state_store.add_visitor_session(
+                bien_so_xe=result_record["bien_so_xe"],
+                ma_loai_xe=result_record["ma_loai_xe"],
+                ma_khu_vuc=result_record["ma_khu_vuc"],
+                ma_vi_tri=result_record["ma_vi_tri"],
+                ma_nhan_vien_vao=result_record["ma_nhan_vien_vao"],
+                anh_vao=result_record["anh_vao"],
+                ma_luot_gui=result_record["ma_luot_gui"],
+                thoi_gian_vao=result_record["thoi_gian_vao"],
+                ten_khu_vuc=result_record.get("ten_khu_vuc"),
+                ten_vi_tri=result_record.get("ten_vi_tri"),
+            )
+
+        self.file_logger.log_parking_history(
+            ma_luot_gui=result_record["ma_luot_gui"],
+            loai_khach=result_record["loai_khach"],
+            bien_so_xe=result_record["bien_so_xe"],
+            ma_loai_xe=result_record["ma_loai_xe"],
+            ma_khu_vuc=result_record["ma_khu_vuc"],
+            ma_vi_tri=result_record["ma_vi_tri"],
+            thoi_gian_vao=result_record["thoi_gian_vao"],
+            anh_vao=result_record["anh_vao"],
+            ma_nhan_vien_vao=result_record["ma_nhan_vien_vao"],
+            trang_thai=ParkingHistoryStatus.DANG_GUI.value,
+            extra={
+                "ten_khu_vuc": result_record.get("ten_khu_vuc") or "",
+                "ten_vi_tri": result_record.get("ten_vi_tri") or "",
+                "ho_ten_chu_xe": result_record.get("ho_ten_chu_xe") or "",
+                "ma_can_ho": result_record.get("ma_can_ho") or "",
+            },
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GATE_IN_ENTRY",
+            doi_tuong="phuong_tien_ra_vao",
+            ma_doi_tuong=result_record["bien_so_xe"],
+            gia_tri_moi={
+                "ma_luot_gui": result_record["ma_luot_gui"],
+                "loai_khach": result_record["loai_khach"],
+                "ma_khu_vuc": result_record["ma_khu_vuc"],
+                "ma_vi_tri": result_record["ma_vi_tri"],
+            },
+        )
+        self._broadcast_parking_state(
+            "gate_in",
+            {
+                "bien_so_xe": result_record["bien_so_xe"],
+                "loai_khach": result_record["loai_khach"],
+                "ma_khu_vuc": result_record["ma_khu_vuc"],
+                "ma_vi_tri": result_record["ma_vi_tri"],
+            },
+        )
+
+        return {
+            "entry": result_record,
+            "message": f"Đã mở cổng cho xe {result_record['bien_so_xe']} vào bãi ({result_record.get('ten_vi_tri') or result_record.get('ten_khu_vuc')}).",
         }
