@@ -347,6 +347,174 @@ class AuthHRHandler:
             "message": "Đặt lại mật khẩu thành công. Vui lòng đăng nhập lại.",
         }
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.2.4 / 2.1.4 / 3.1.4 / 4.1.7: XEM & CẬP NHẬT HỒ SƠ CÁ NHÂN
+    # ==========================================================================
+    def _fetch_account_row(self, db: Any, ma_tai_khoan: int) -> Optional[Dict[str, Any]]:
+        return db.fetch_one(
+            """
+            SELECT tk.ma_tai_khoan,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   tk.trang_thai,
+                   tk.ly_do_khoa,
+                   tk.ngay_tao,
+                   cd.ma_cu_dan,
+                   cd.ma_can_ho,
+                   cd.ho_ten AS cd_ho_ten,
+                   cd.so_cccd AS cd_cccd,
+                   cd.so_dien_thoai AS cd_sdt,
+                   cd.email AS cd_email,
+                   cd.dia_chi,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   ch.so_cho_oto_mac_dinh,
+                   ch.so_cho_oto_mua_them,
+                   nv.ma_nhan_vien,
+                   nv.ma_nhan_vien_code,
+                   nv.ho_ten AS nv_ho_ten,
+                   nv.so_cccd AS nv_cccd,
+                   nv.so_dien_thoai AS nv_sdt,
+                   nv.email AS nv_email,
+                   nv.chuc_vu
+            FROM tai_khoan tk
+            LEFT JOIN cu_dan cd ON cd.ma_tai_khoan = tk.ma_tai_khoan
+            LEFT JOIN can_ho ch ON ch.ma_can_ho = cd.ma_can_ho
+            LEFT JOIN nhan_vien nv ON nv.ma_tai_khoan = tk.ma_tai_khoan
+            WHERE tk.ma_tai_khoan = %s
+            """,
+            (int(ma_tai_khoan),),
+        )
+
+    def _check_unique_contact(
+        self,
+        db: Any,
+        *,
+        so_cccd: str,
+        email: str,
+        exclude_tai_khoan: Optional[int] = None,
+    ) -> None:
+        """Kiểm tra trùng CCCD hoặc Email trên toàn bộ bảng cu_dan & nhan_vien."""
+        excl = int(exclude_tai_khoan) if exclude_tai_khoan is not None else -1
+        dup = db.fetch_one(
+            """
+            SELECT 'cccd' AS field FROM cu_dan WHERE so_cccd = %s AND ma_tai_khoan <> %s
+            UNION ALL
+            SELECT 'cccd' AS field FROM nhan_vien WHERE so_cccd = %s AND ma_tai_khoan <> %s
+            UNION ALL
+            SELECT 'email' AS field FROM cu_dan WHERE LOWER(email) = LOWER(%s) AND ma_tai_khoan <> %s
+            UNION ALL
+            SELECT 'email' AS field FROM nhan_vien WHERE LOWER(email) = LOWER(%s) AND ma_tai_khoan <> %s
+            LIMIT 1
+            """,
+            (so_cccd, excl, so_cccd, excl, email, excl, email, excl),
+        )
+        if dup:
+            if dup.get("field") == "cccd":
+                raise BusinessError(f"Số CCCD '{so_cccd}' đã được sử dụng bởi tài khoản khác.")
+            raise BusinessError(f"Email '{email}' đã được sử dụng bởi tài khoản khác.")
+
+    def handle_get_profile(
+        self, session: ClientSession, _payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.2.4 / 2.1.4 / 3.1.4 / 4.1.7: Xem hồ sơ cá nhân của tài khoản đang đăng nhập."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên đăng nhập không hợp lệ.")
+        db = self._db()
+        row = self._fetch_account_row(db, int(session.ma_tai_khoan))
+        if not row:
+            raise BusinessError("Không tìm thấy hồ sơ tài khoản.")
+        profile = self._build_public_user(row)
+        profile["ngay_tao"] = row.get("ngay_tao")
+        profile["toa_nha"] = row.get("toa_nha")
+        profile["so_tang"] = row.get("so_tang")
+        profile["so_cho_oto_mac_dinh"] = row.get("so_cho_oto_mac_dinh")
+        profile["so_cho_oto_mua_them"] = row.get("so_cho_oto_mua_them")
+        return {"profile": profile}
+
+    def handle_update_profile(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.2.4 / 2.1.4 / 3.1.4: Cập nhật hồ sơ cá nhân (chặn Admin 4.1.7 chỉ xem)."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên đăng nhập không hợp lệ.")
+        if session.vai_tro == Roles.ADMIN.value:
+            raise PermissionError("Tài khoản Admin chỉ có quyền xem hồ sơ cá nhân.")
+
+        db = self._db()
+        current_row = self._fetch_account_row(db, int(session.ma_tai_khoan))
+        if not current_row:
+            raise BusinessError("Không tìm thấy hồ sơ tài khoản.")
+
+        old_profile = self._build_public_user(current_row)
+        ho_ten = str(payload.get("ho_ten") if payload.get("ho_ten") is not None else old_profile["ho_ten"]).strip()
+        so_cccd = str(payload.get("so_cccd") if payload.get("so_cccd") is not None else old_profile["so_cccd"]).strip()
+        so_dien_thoai = str(
+            payload.get("so_dien_thoai") if payload.get("so_dien_thoai") is not None else old_profile["so_dien_thoai"]
+        ).strip()
+        email = str(payload.get("email") if payload.get("email") is not None else old_profile["email"]).strip().lower()
+        dia_chi = str(payload.get("dia_chi") if payload.get("dia_chi") is not None else old_profile["dia_chi"]).strip()
+
+        if not ho_ten:
+            raise BusinessError("Họ và tên không được để trống.")
+        if not validate_cccd(so_cccd):
+            raise BusinessError("Số CCCD/CMND phải gồm 9 hoặc 12 chữ số.")
+        if not validate_phone(so_dien_thoai):
+            raise BusinessError("Số điện thoại không đúng định dạng Việt Nam.")
+        if not validate_email(email):
+            raise BusinessError("Địa chỉ email không hợp lệ.")
+
+        self._check_unique_contact(
+            db,
+            so_cccd=so_cccd,
+            email=email,
+            exclude_tai_khoan=int(session.ma_tai_khoan),
+        )
+
+        if session.vai_tro == Roles.CU_DAN.value:
+            db.execute(
+                """
+                UPDATE cu_dan
+                SET ho_ten = %s, so_cccd = %s, so_dien_thoai = %s, email = %s, dia_chi = %s
+                WHERE ma_tai_khoan = %s
+                """,
+                (ho_ten, so_cccd, so_dien_thoai, email, dia_chi or None, int(session.ma_tai_khoan)),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE nhan_vien
+                SET ho_ten = %s, so_cccd = %s, so_dien_thoai = %s, email = %s
+                WHERE ma_tai_khoan = %s
+                """,
+                (ho_ten, so_cccd, so_dien_thoai, email, int(session.ma_tai_khoan)),
+            )
+
+        session.ho_ten = ho_ten
+        updated_row = self._fetch_account_row(db, int(session.ma_tai_khoan))
+        new_profile = self._build_public_user(updated_row or current_row)
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="CAP_NHAT_HO_SO",
+            doi_tuong="ho_so_ca_nhan",
+            ma_doi_tuong=session.ma_tai_khoan,
+            gia_tri_cu={
+                "ho_ten": old_profile["ho_ten"],
+                "so_cccd": old_profile["so_cccd"],
+                "so_dien_thoai": old_profile["so_dien_thoai"],
+                "email": old_profile["email"],
+            },
+            gia_tri_moi={
+                "ho_ten": new_profile["ho_ten"],
+                "so_cccd": new_profile["so_cccd"],
+                "so_dien_thoai": new_profile["so_dien_thoai"],
+                "email": new_profile["email"],
+            },
+        )
+        return {"profile": new_profile}
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -410,5 +578,19 @@ def register_auth_hr_routes(
         allowed_roles=None,
         is_mutation=False,
         require_auth=False,
+    )
+    router.register(
+        Actions.AUTH_GET_PROFILE,
+        handler.handle_get_profile,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.AUTH_UPDATE_PROFILE,
+        handler.handle_update_profile,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.CU_DAN.value],
+        is_mutation=True,
+        require_auth=True,
     )
     return handler
