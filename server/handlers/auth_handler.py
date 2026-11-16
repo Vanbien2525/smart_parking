@@ -10,6 +10,7 @@ from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession, SessionManager
 from shared.constants import AccountStatus, AuthResults, Roles
 from shared.protocol import Actions
+from shared.validators import validate_cccd, validate_email, validate_phone
 
 
 def _resolve_db(db_provider: Any = None) -> Any:
@@ -238,6 +239,114 @@ class AuthHRHandler:
         )
         return {"updated": True, "message": "Đổi mật khẩu thành công."}
 
+    # ==========================================================================
+    # CHỨC NĂNG 4.1.3 - 4.1.6 & 1.2.3 / 2.1.3 / 3.1.3: QUÊN MẬT KHẨU OTP 4 BƯỚC
+    # ==========================================================================
+    def _require_otp_service(self) -> OTPService:
+        if self.otp_service is None:
+            raise BusinessError("Dịch vụ OTP chưa được khởi tạo trên Server.")
+        return self.otp_service
+
+    def handle_request_otp(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.1.3: Tra cứu email trong cu_dan/nhan_vien và gửi mã OTP 6 số qua SMTP."""
+        email = str(payload.get("email") or "").strip().lower()
+        if not validate_email(email):
+            raise BusinessError("Địa chỉ email không hợp lệ.")
+
+        db = self._db()
+        account = db.fetch_one(
+            """
+            SELECT tk.ma_tai_khoan, tk.ten_dang_nhap, tk.vai_tro, tk.trang_thai
+            FROM tai_khoan tk
+            LEFT JOIN cu_dan cd ON cd.ma_tai_khoan = tk.ma_tai_khoan
+            LEFT JOIN nhan_vien nv ON nv.ma_tai_khoan = tk.ma_tai_khoan
+            WHERE LOWER(COALESCE(cd.email, nv.email, '')) = %s
+            LIMIT 1
+            """,
+            (email,),
+        )
+        if not account:
+            raise BusinessError("Không tìm thấy tài khoản nào gắn với địa chỉ email này.")
+        if account.get("trang_thai") != AccountStatus.HOAT_DONG.value:
+            raise BusinessError("Tài khoản gắn với email này đang tạm khóa, không thể khôi phục mật khẩu.")
+
+        otp_svc = self._require_otp_service()
+        try:
+            return otp_svc.request_otp(email=email, ma_tai_khoan=int(account["ma_tai_khoan"]))
+        except RuntimeError as exc:
+            raise BusinessError(str(exc)) from exc
+
+    def handle_resend_otp(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.1.4: Kiểm tra cooldown 60s, vô hiệu mã cũ và gửi lại OTP mới."""
+        ma_yeu_cau_otp = str(payload.get("ma_yeu_cau_otp") or "").strip()
+        if not ma_yeu_cau_otp:
+            raise BusinessError("Thiếu mã yêu cầu OTP (`ma_yeu_cau_otp`).")
+        otp_svc = self._require_otp_service()
+        try:
+            return otp_svc.resend_otp(ma_yeu_cau_otp)
+        except RuntimeError as exc:
+            raise BusinessError(str(exc)) from exc
+
+    def handle_verify_otp(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.1.5: Xác minh mã OTP 6 số và cấp `reset_token` có thời hạn."""
+        ma_yeu_cau_otp = str(payload.get("ma_yeu_cau_otp") or "").strip()
+        ma_otp = str(payload.get("ma_otp") or "").strip()
+        if not ma_yeu_cau_otp or not ma_otp:
+            raise BusinessError("Vui lòng nhập đầy đủ mã yêu cầu và mã OTP 6 số.")
+        otp_svc = self._require_otp_service()
+        return otp_svc.verify_otp(ma_yeu_cau_otp, ma_otp)
+
+    def handle_reset_password(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """4.1.6: Đặt lại mật khẩu mới bằng `reset_token` và thu hồi mọi phiên cũ."""
+        reset_token = str(payload.get("reset_token") or "").strip()
+        mat_khau_moi = str(payload.get("mat_khau_moi") or "")
+        xac_nhan = str(payload.get("xac_nhan") or payload.get("xac_nhan_mat_khau") or "")
+        if not reset_token:
+            raise BusinessError("Thiếu `reset_token` xác thực OTP.")
+        validate_new_password(mat_khau_moi, xac_nhan)
+
+        otp_svc = self._require_otp_service()
+        ma_tai_khoan = otp_svc.consume_reset_token(reset_token)
+        new_hash = hash_password(mat_khau_moi)
+
+        db = self._db()
+        acc = db.fetch_one(
+            "SELECT ma_tai_khoan, ten_dang_nhap, vai_tro FROM tai_khoan WHERE ma_tai_khoan = %s",
+            (ma_tai_khoan,),
+        )
+        db.execute(
+            "UPDATE tai_khoan SET mat_khau_bam = %s WHERE ma_tai_khoan = %s",
+            (new_hash, ma_tai_khoan),
+        )
+        revoked = self.session_manager.revoke_user_sessions(
+            ma_tai_khoan,
+            "Đặt lại mật khẩu qua OTP",
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=ma_tai_khoan,
+            ten_dang_nhap=(acc or {}).get("ten_dang_nhap") or "",
+            vai_tro=(acc or {}).get("vai_tro") or "",
+            loai_thao_tac="DAT_LAI_MAT_KHAU_OTP",
+            doi_tuong="tai_khoan",
+            ma_doi_tuong=ma_tai_khoan,
+            gia_tri_cu={"password": "***"},
+            gia_tri_moi={"password": "***", "revoked_sessions": revoked},
+        )
+        return {
+            "reset": True,
+            "ma_tai_khoan": ma_tai_khoan,
+            "revoked_sessions": revoked,
+            "message": "Đặt lại mật khẩu thành công. Vui lòng đăng nhập lại.",
+        }
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -273,5 +382,33 @@ def register_auth_hr_routes(
         allowed_roles=None,
         is_mutation=False,
         require_auth=True,
+    )
+    router.register(
+        Actions.AUTH_REQUEST_OTP,
+        handler.handle_request_otp,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=False,
+    )
+    router.register(
+        Actions.AUTH_RESEND_OTP,
+        handler.handle_resend_otp,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=False,
+    )
+    router.register(
+        Actions.AUTH_VERIFY_OTP,
+        handler.handle_verify_otp,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=False,
+    )
+    router.register(
+        Actions.AUTH_RESET_PASSWORD,
+        handler.handle_reset_password,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=False,
     )
     return handler
