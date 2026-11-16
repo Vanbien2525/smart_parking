@@ -742,6 +742,202 @@ class BillingHandler:
             "ma_bien_lai": ma_bien_lai,
         }
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.7.1 - 1.7.4: QUẢN LÝ THEO DÕI THU PHÍ
+    # ==========================================================================
+    def handle_list_receivables(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.7.1: Xem danh sách khoản phải thu theo kỳ thu, trạng thái và căn hộ."""
+        ky_thu = str(payload.get("ky_thu_thang_nam") or "").strip()
+        trang_thai = str(payload.get("trang_thai_hoa_don") or "").strip()
+        keyword = str(payload.get("keyword") or payload.get("ma_can_ho") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if ky_thu:
+            conditions.append("hd.ky_thu_thang_nam = %s")
+            params.append(ky_thu)
+        if trang_thai:
+            conditions.append("hd.trang_thai_hoa_don = %s")
+            params.append(trang_thai)
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append("(hd.ma_can_ho ILIKE %s OR CAST(hd.ma_hoa_don AS TEXT) ILIKE %s)")
+            params.extend([like, like])
+
+        where_sql = " AND ".join(conditions)
+        rows = self._db().fetch_all(
+            f"""
+            SELECT hd.ma_hoa_don,
+                   hd.ma_can_ho,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   hd.ky_thu_thang_nam,
+                   hd.so_cho_oto_mac_dinh,
+                   hd.so_cho_oto_mua_them,
+                   hd.so_luong_xe_may,
+                   hd.tong_tien_phai_thu,
+                   hd.trang_thai_hoa_don,
+                   hd.ngay_tao_hoa_don
+            FROM hoa_don_thang hd
+            JOIN can_ho ch ON ch.ma_can_ho = hd.ma_can_ho
+            WHERE {where_sql}
+            ORDER BY hd.ngay_tao_hoa_don DESC, hd.ma_can_ho ASC
+            """,
+            tuple(params),
+        )
+        return {"total": len(rows), "items": rows}
+
+    def handle_list_collected(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.7.2: Xem danh sách khoản đã thu lọc theo khoảng ngày, nhân viên thu, hình thức."""
+        tu_ngay = str(payload.get("tu_ngay") or "").strip()
+        den_ngay = str(payload.get("den_ngay") or "").strip()
+        hinh_thuc = str(payload.get("hinh_thuc_thanh_toan") or "").strip()
+        ma_nv = payload.get("ma_nhan_vien_thu")
+        ky_thu = str(payload.get("ky_thu_thang_nam") or "").strip()
+
+        conditions = ["gd.trang_thai_giao_dich = %s"]
+        params: List[Any] = [TransactionStatus.THANH_TOAN_THANH_CONG.value]
+        if tu_ngay:
+            conditions.append("gd.thoi_gian_giao_dich::date >= %s::date")
+            params.append(tu_ngay)
+        if den_ngay:
+            conditions.append("gd.thoi_gian_giao_dich::date <= %s::date")
+            params.append(den_ngay)
+        if hinh_thuc:
+            conditions.append("gd.hinh_thuc_thanh_toan = %s")
+            params.append(hinh_thuc)
+        if ma_nv not in (None, ""):
+            conditions.append("gd.ma_nhan_vien_thu = %s")
+            params.append(int(ma_nv))
+        if ky_thu:
+            conditions.append("hd.ky_thu_thang_nam = %s")
+            params.append(ky_thu)
+
+        where_sql = " AND ".join(conditions)
+        rows = self._db().fetch_all(
+            f"""
+            SELECT gd.ma_giao_dich,
+                   gd.ma_hoa_don,
+                   hd.ma_can_ho,
+                   hd.ky_thu_thang_nam,
+                   gd.hinh_thuc_thanh_toan,
+                   gd.so_tien_thanh_toan,
+                   gd.ma_bien_lai,
+                   gd.ma_nhan_vien_thu,
+                   nv.ho_ten AS ten_nhan_vien_thu,
+                   nv.ma_nhan_vien_code,
+                   gd.trang_thai_giao_dich,
+                   gd.thoi_gian_giao_dich
+            FROM giao_dich_thanh_toan gd
+            JOIN hoa_don_thang hd ON hd.ma_hoa_don = gd.ma_hoa_don
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = gd.ma_nhan_vien_thu
+            WHERE {where_sql}
+            ORDER BY gd.thoi_gian_giao_dich DESC, gd.ma_giao_dich DESC
+            """,
+            tuple(params),
+        )
+        return {"total": len(rows), "items": rows}
+
+    def handle_billing_summary(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.7.3: Tổng hợp thu phí theo kỳ (Tổng phải thu, tổng đã thu, tổng còn nợ)."""
+        ky_thu = str(payload.get("ky_thu_thang_nam") or "").strip()
+        db = self._db()
+
+        if ky_thu:
+            row = db.fetch_one(
+                """
+                SELECT
+                    COALESCE(SUM(tong_tien_phai_thu), 0) AS tong_phai_thu,
+                    COALESCE(SUM(CASE WHEN trang_thai_hoa_don = %s THEN tong_tien_phai_thu ELSE 0 END), 0) AS tong_da_thu,
+                    COALESCE(SUM(CASE WHEN trang_thai_hoa_don IN (%s, %s) THEN tong_tien_phai_thu ELSE 0 END), 0) AS tong_con_no,
+                    COUNT(*) AS tong_hoa_don,
+                    COUNT(CASE WHEN trang_thai_hoa_don = %s THEN 1 END) AS so_da_thu,
+                    COUNT(CASE WHEN trang_thai_hoa_don IN (%s, %s) THEN 1 END) AS so_con_no
+                FROM hoa_don_thang
+                WHERE ky_thu_thang_nam = %s
+                """,
+                (
+                    InvoiceStatus.DA_THANH_TOAN.value,
+                    InvoiceStatus.CHUA_THANH_TOAN.value,
+                    InvoiceStatus.QUA_HAN.value,
+                    InvoiceStatus.DA_THANH_TOAN.value,
+                    InvoiceStatus.CHUA_THANH_TOAN.value,
+                    InvoiceStatus.QUA_HAN.value,
+                    ky_thu,
+                ),
+            )
+        else:
+            row = db.fetch_one(
+                """
+                SELECT
+                    COALESCE(SUM(tong_tien_phai_thu), 0) AS tong_phai_thu,
+                    COALESCE(SUM(CASE WHEN trang_thai_hoa_don = %s THEN tong_tien_phai_thu ELSE 0 END), 0) AS tong_da_thu,
+                    COALESCE(SUM(CASE WHEN trang_thai_hoa_don IN (%s, %s) THEN tong_tien_phai_thu ELSE 0 END), 0) AS tong_con_no,
+                    COUNT(*) AS tong_hoa_don,
+                    COUNT(CASE WHEN trang_thai_hoa_don = %s THEN 1 END) AS so_da_thu,
+                    COUNT(CASE WHEN trang_thai_hoa_don IN (%s, %s) THEN 1 END) AS so_con_no
+                FROM hoa_don_thang
+                """,
+                (
+                    InvoiceStatus.DA_THANH_TOAN.value,
+                    InvoiceStatus.CHUA_THANH_TOAN.value,
+                    InvoiceStatus.QUA_HAN.value,
+                    InvoiceStatus.DA_THANH_TOAN.value,
+                    InvoiceStatus.CHUA_THANH_TOAN.value,
+                    InvoiceStatus.QUA_HAN.value,
+                ),
+            )
+        data = row or {}
+        return {
+            "ky_thu_thang_nam": ky_thu or "Tất cả kỳ",
+            "tong_phai_thu": float(data.get("tong_phai_thu") or 0),
+            "tong_da_thu": float(data.get("tong_da_thu") or 0),
+            "tong_con_no": float(data.get("tong_con_no") or 0),
+            "tong_hoa_don": int(data.get("tong_hoa_don") or 0),
+            "so_da_thu": int(data.get("so_da_thu") or 0),
+            "so_con_no": int(data.get("so_con_no") or 0),
+        }
+
+    def handle_get_transaction_detail(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.7.4: Xem chi tiết 1 giao dịch thanh toán kèm hóa đơn, căn hộ, bảng giá và người thu."""
+        ma_giao_dich = payload.get("ma_giao_dich")
+        if ma_giao_dich is None:
+            raise BusinessError("Thiếu `ma_giao_dich` để xem chi tiết thanh toán.")
+
+        db = self._db()
+        tx_row = db.fetch_one(
+            """
+            SELECT gd.*,
+                   hd.ma_can_ho, hd.ky_thu_thang_nam, hd.so_cho_oto_mac_dinh,
+                   hd.so_cho_oto_mua_them, hd.so_luong_xe_may, hd.tong_tien_phai_thu,
+                   hd.trang_thai_hoa_don,
+                   ch.toa_nha, ch.so_tang,
+                   nv.ho_ten AS ten_nhan_vien_thu, nv.ma_nhan_vien_code
+            FROM giao_dich_thanh_toan gd
+            JOIN hoa_don_thang hd ON hd.ma_hoa_don = gd.ma_hoa_don
+            JOIN can_ho ch ON ch.ma_can_ho = hd.ma_can_ho
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = gd.ma_nhan_vien_thu
+            WHERE gd.ma_giao_dich = %s
+            """,
+            (int(ma_giao_dich),),
+        )
+        if not tx_row:
+            raise BusinessError(f"Không tìm thấy giao dịch mã {ma_giao_dich}.")
+
+        rates = self._load_active_monthly_rates(db)
+        return {
+            "transaction": tx_row,
+            "applied_rates": rates,
+        }
+
 
 def register_billing_routes(
     router: Router,
@@ -804,6 +1000,34 @@ def register_billing_routes(
         handler.handle_confirm_cash_payment,
         allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value],
         is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_LIST_RECEIVABLES,
+        handler.handle_list_receivables,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_LIST_COLLECTED,
+        handler.handle_list_collected,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_SUMMARY,
+        handler.handle_billing_summary,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_GET_TRANSACTION_DETAIL,
+        handler.handle_get_transaction_detail,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
         require_auth=True,
     )
     return handler
