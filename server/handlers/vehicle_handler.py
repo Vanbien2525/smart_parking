@@ -18,6 +18,8 @@ from server.core.file_logger import FileLogger
 from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession
 from shared.constants import (
+    PricingGroups,
+    PricingStatus,
     RequestStatus,
     Roles,
     SlotAllocationStatus,
@@ -1294,6 +1296,178 @@ class VehicleHandler:
         )
         return {"request": updated}
 
+    # ==========================================================================
+    # 3.3.1 – 3.3.5: CƯ DÂN MUA THÊM CHỖ ĐỖ Ô TÔ & XEM VỊ TRÍ ĐƯỢC CẤP
+    # ==========================================================================
+    def handle_resident_extra_slots_data(
+        self, session: ClientSession, _payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.3.2 – 3.3.5: Lấy hạn mức, danh sách chỗ đỗ ô tô được cấp & lịch sử yêu cầu mua thêm."""
+        db = self._db()
+        ma_cu_dan, ma_can_ho, apartment = self._resolve_resident_context(db, session)
+        quota = self._get_apartment_quota_stats(db, ma_can_ho, apartment)
+
+        price_rows = db.fetch_all(
+            """
+            SELECT nhom_ap_dung, muc_phi
+            FROM bang_gia
+            WHERE trang_thai_gia = %s
+              AND nhom_ap_dung IN (%s, %s)
+            ORDER BY ma_bang_gia DESC
+            """,
+            (
+                PricingStatus.DANG_AP_DUNG.value,
+                PricingGroups.CHO_OTO_MAC_DINH.value,
+                PricingGroups.CHO_OTO_MUA_THEM.value,
+            ),
+        )
+        pricing: Dict[str, float] = {
+            PricingGroups.CHO_OTO_MAC_DINH.value: 0.0,
+            PricingGroups.CHO_OTO_MUA_THEM.value: 0.0,
+        }
+        for pr in price_rows:
+            nhom = str(pr["nhom_ap_dung"])
+            if pricing.get(nhom, 0.0) == 0.0:
+                pricing[nhom] = float(pr["muc_phi"] or 0.0)
+
+        allocations = db.fetch_all(
+            """
+            SELECT pb.ma_phan_bo,
+                   pb.ma_can_ho,
+                   pb.ma_vi_tri,
+                   pb.loai_cho_cap,
+                   pb.ngay_cap,
+                   pb.trang_thai_su_dung,
+                   pb.ly_do_thu_hoi,
+                   vt.ten_vi_tri,
+                   vt.ma_khu_vuc,
+                   vt.nhom_vi_tri,
+                   vt.trang_thai_vi_tri,
+                   kv.ten_khu_vuc,
+                   ql.ma_phuong_tien,
+                   ql.dang_trong_bai,
+                   pt.bien_so_xe,
+                   pt.ten_hang_dong_xe
+            FROM phan_bo_cho_do pb
+            JOIN vi_tri_do vt ON vt.ma_vi_tri = pb.ma_vi_tri
+            JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql
+                   ON ql.ma_vi_tri_co_dinh = pb.ma_vi_tri
+            LEFT JOIN phuong_tien pt
+                   ON pt.ma_phuong_tien = ql.ma_phuong_tien
+                  AND pt.trang_thai_xe = %s
+            WHERE pb.ma_can_ho = %s
+            ORDER BY
+                CASE pb.trang_thai_su_dung WHEN 'dang_hieu_luc' THEN 0 ELSE 1 END,
+                pb.ma_phan_bo DESC
+            """,
+            (VehicleStatus.DANG_HOAT_DONG.value, ma_can_ho),
+        )
+        for alloc in allocations:
+            fee_key = (
+                PricingGroups.CHO_OTO_MAC_DINH.value
+                if alloc["loai_cho_cap"] == SlotAllocationTypes.CHO_MAC_DINH_XE_1.value
+                else PricingGroups.CHO_OTO_MUA_THEM.value
+            )
+            alloc["muc_phi_thang"] = pricing.get(fee_key, 0.0)
+
+        requests = db.fetch_all(
+            """
+            SELECT yc.ma_yeu_cau_cho,
+                   yc.ma_cu_dan,
+                   yc.ma_can_ho,
+                   yc.nhu_cau_vi_tri,
+                   yc.ly_do_mua_them,
+                   yc.trang_thai_duyet,
+                   yc.ma_vi_tri_duoc_duyet,
+                   vt.ten_vi_tri,
+                   kv.ten_khu_vuc,
+                   yc.ma_nhan_vien_duyet,
+                   nv.ho_ten AS ten_quan_ly_duyet,
+                   yc.ly_do_tu_choi,
+                   yc.ngay_gui_yeu_cau
+            FROM yeu_cau_mua_them_cho yc
+            LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = yc.ma_vi_tri_duoc_duyet
+            LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = yc.ma_nhan_vien_duyet
+            WHERE yc.ma_can_ho = %s
+            ORDER BY yc.ngay_gui_yeu_cau DESC, yc.ma_yeu_cau_cho DESC
+            """,
+            (ma_can_ho,),
+        )
+
+        return {
+            "ma_cu_dan": ma_cu_dan,
+            "quota": quota,
+            "pricing": pricing,
+            "allocations": allocations,
+            "requests": requests,
+        }
+
+    def handle_resident_submit_extra_slot(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.3.1: Cư dân gửi yêu cầu mua thêm chỗ đỗ ô tô cho căn hộ."""
+        nhu_cau_vi_tri = str(
+            payload.get("nhu_cau_vi_tri") or payload.get("vi_tri_mong_muon") or "Hầm B1 Ô tô"
+        ).strip()
+        ly_do_mua_them = str(
+            payload.get("ly_do_mua_them") or payload.get("ly_do_yeu_cau") or ""
+        ).strip()
+        if not nhu_cau_vi_tri:
+            raise BusinessError("Vui lòng nhập nhu cầu vị trí / khu vực mong muốn.")
+        if not ly_do_mua_them:
+            raise BusinessError("Vui lòng nhập lý do mua thêm chỗ đỗ ô tô.")
+
+        db = self._db()
+        with db.transaction() as tx:
+            ma_cu_dan, ma_can_ho, _ = self._resolve_resident_context(tx, session)
+            pending = tx.fetch_one(
+                """
+                SELECT ma_yeu_cau_cho
+                FROM yeu_cau_mua_them_cho
+                WHERE ma_can_ho = %s AND trang_thai_duyet = %s
+                FOR UPDATE
+                """,
+                (ma_can_ho, RequestStatus.CHO_DUYET.value),
+            )
+            if pending:
+                raise BusinessError(
+                    f"Căn hộ {ma_can_ho} đã có yêu cầu mua thêm chỗ #{pending['ma_yeu_cau_cho']} đang chờ duyệt."
+                )
+
+            req_row = tx.execute_returning(
+                """
+                INSERT INTO yeu_cau_mua_them_cho (
+                    ma_cu_dan, ma_can_ho, nhu_cau_vi_tri, ly_do_mua_them, trang_thai_duyet
+                ) VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    ma_cu_dan,
+                    ma_can_ho,
+                    nhu_cau_vi_tri[:255],
+                    ly_do_mua_them[:255],
+                    RequestStatus.CHO_DUYET.value,
+                ),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GUI_YEU_CAU_MUA_THEM_CHO",
+            doi_tuong="yeu_cau_mua_them_cho",
+            ma_doi_tuong=req_row["ma_yeu_cau_cho"] if req_row else None,
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "ma_can_ho": ma_can_ho,
+                "nhu_cau_vi_tri": nhu_cau_vi_tri[:255],
+                "ly_do_mua_them": ly_do_mua_them[:255],
+            },
+        )
+        return {"request": req_row}
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1347,6 +1521,18 @@ def register_vehicle_routes(
         Actions.VEHICLE_REJECT_REQUEST,
         handler.handle_reject_request,
         allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+    )
+    router.register(
+        Actions.SLOT_REQUEST_RESIDENT_DATA,
+        handler.handle_resident_extra_slots_data,
+        allowed_roles=[Roles.CU_DAN.value],
+        is_mutation=False,
+    )
+    router.register(
+        Actions.SLOT_REQUEST_SUBMIT,
+        handler.handle_resident_submit_extra_slot,
+        allowed_roles=[Roles.CU_DAN.value],
         is_mutation=True,
     )
     return handler
