@@ -36,6 +36,17 @@ def verify_password(raw_password: str, hashed_password: str) -> bool:
         return False
 
 
+def validate_new_password(new_password: str, confirm_password: str) -> str:
+    """Kiểm tra độ mạnh cơ bản và xác nhận mật khẩu mới."""
+    if not new_password or len(new_password) < 6:
+        raise BusinessError("Mật khẩu mới phải có ít nhất 6 ký tự.")
+    if len(new_password) > 100:
+        raise BusinessError("Mật khẩu mới không được vượt quá 100 ký tự.")
+    if new_password != confirm_password:
+        raise BusinessError("Mật khẩu xác nhận không khớp.")
+    return new_password
+
+
 class AuthHRHandler:
     """Xử lý các API Xác thực, Hồ sơ cá nhân, OTP khôi phục và Quản lý Nhân sự (1.3)."""
 
@@ -182,6 +193,51 @@ class AuthHRHandler:
             )
         return {"logged_out": True}
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.2.2 / 2.1.2 / 3.1.2 / 4.1.2: ĐỔI MẬT KHẨU CÁ NHÂN
+    # ==========================================================================
+    def handle_change_password(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Kiểm tra mật khẩu hiện tại, băm mật khẩu mới và ghi audit log."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên đăng nhập không hợp lệ.")
+
+        mat_khau_hien_tai = str(payload.get("mat_khau_hien_tai") or "")
+        mat_khau_moi = str(payload.get("mat_khau_moi") or "")
+        xac_nhan = str(payload.get("xac_nhan_mat_khau") or "")
+
+        if not mat_khau_hien_tai:
+            raise BusinessError("Vui lòng nhập mật khẩu hiện tại.")
+        validate_new_password(mat_khau_moi, xac_nhan)
+        if mat_khau_moi == mat_khau_hien_tai:
+            raise BusinessError("Mật khẩu mới phải khác mật khẩu hiện tại.")
+
+        db = self._db()
+        row = db.fetch_one(
+            "SELECT ma_tai_khoan, mat_khau_bam FROM tai_khoan WHERE ma_tai_khoan = %s",
+            (int(session.ma_tai_khoan),),
+        )
+        if not row or not verify_password(mat_khau_hien_tai, str(row.get("mat_khau_bam") or "")):
+            raise BusinessError("Mật khẩu hiện tại không chính xác.")
+
+        new_hash = hash_password(mat_khau_moi)
+        db.execute(
+            "UPDATE tai_khoan SET mat_khau_bam = %s WHERE ma_tai_khoan = %s",
+            (new_hash, int(session.ma_tai_khoan)),
+        )
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="DOI_MAT_KHAU",
+            doi_tuong="tai_khoan",
+            ma_doi_tuong=session.ma_tai_khoan,
+            gia_tri_cu={"password": "***"},
+            gia_tri_moi={"password": "***"},
+        )
+        return {"updated": True, "message": "Đổi mật khẩu thành công."}
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -207,6 +263,13 @@ def register_auth_hr_routes(
     router.register(
         Actions.AUTH_LOGOUT,
         handler.handle_logout,
+        allowed_roles=None,
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.AUTH_CHANGE_PASSWORD,
+        handler.handle_change_password,
         allowed_roles=None,
         is_mutation=False,
         require_auth=True,
