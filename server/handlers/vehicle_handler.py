@@ -1234,6 +1234,66 @@ class VehicleHandler:
             "ma_khu_vuc_phan_cong": assigned_zone_code,
         }
 
+    # ==========================================================================
+    # 1.4.3: QUẢN LÝ TỪ CHỐI YÊU CẦU PHƯƠNG TIỆN KÈM LÝ DO
+    # ==========================================================================
+    def handle_reject_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.3: Từ chối yêu cầu đăng ký/chỉnh sửa/ngừng đăng ký xe kèm lý do bắt buộc."""
+        try:
+            ma_yeu_cau_xe = int(payload.get("ma_yeu_cau_xe") or payload.get("ma_yeu_cau_dang_ky"))
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_yeu_cau_xe`.") from exc
+
+        ly_do = str(
+            payload.get("ly_do_phan_hoi") or payload.get("ly_do_tu_choi") or ""
+        ).strip()
+        if not ly_do:
+            raise BusinessError("Vui lòng nhập lý do từ chối yêu cầu phương tiện.")
+
+        db = self._db()
+        with db.transaction() as tx:
+            staff_id = self._resolve_staff_id(tx, session)
+            req = tx.fetch_one(
+                "SELECT * FROM yeu_cau_dang_ky_xe WHERE ma_yeu_cau_xe = %s FOR UPDATE",
+                (ma_yeu_cau_xe,),
+            )
+            if not req:
+                raise BusinessError(f"Không tìm thấy yêu cầu phương tiện #{ma_yeu_cau_xe}.")
+            if req["trang_thai_duyet"] != RequestStatus.CHO_DUYET.value:
+                raise BusinessError("Yêu cầu này đã được xử lý trước đó.")
+
+            if req["loai_yeu_cau"] == VehicleRequestTypes.DANG_KY_MOI.value:
+                tx.execute(
+                    "UPDATE phuong_tien SET trang_thai_xe = %s WHERE ma_phuong_tien = %s",
+                    ("ngung_hieu_luc", req["ma_phuong_tien"]),
+                )
+
+            updated = tx.execute_returning(
+                """
+                UPDATE yeu_cau_dang_ky_xe
+                SET trang_thai_duyet = %s,
+                    ma_nhan_vien_duyet = %s,
+                    ly_do_phan_hoi = %s
+                WHERE ma_yeu_cau_xe = %s
+                RETURNING *
+                """,
+                (RequestStatus.TU_CHOI.value, staff_id, ly_do[:255], ma_yeu_cau_xe),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="TU_CHOI_YEU_CAU_PHUONG_TIEN",
+            doi_tuong="yeu_cau_dang_ky_xe",
+            ma_doi_tuong=ma_yeu_cau_xe,
+            gia_tri_cu={"trang_thai_duyet": RequestStatus.CHO_DUYET.value},
+            gia_tri_moi={"trang_thai_duyet": RequestStatus.TU_CHOI.value, "ly_do_phan_hoi": ly_do[:255]},
+        )
+        return {"request": updated}
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1280,6 +1340,12 @@ def register_vehicle_routes(
     router.register(
         Actions.VEHICLE_APPROVE_REQUEST,
         handler.handle_approve_request,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+    )
+    router.register(
+        Actions.VEHICLE_REJECT_REQUEST,
+        handler.handle_reject_request,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
     )
