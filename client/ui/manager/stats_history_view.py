@@ -7,9 +7,12 @@
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QComboBox,
+    QDateEdit,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -413,3 +417,292 @@ class ManagerMonitorView(QWidget):
                 self.tbl_detail.setItem(i, 3, QTableWidgetItem(f"{guest} · {r.get('ma_loai_xe') or ''}"))
                 self.tbl_detail.setItem(i, 4, QTableWidgetItem(f"{r.get('ten_chu_xe') or '-'} ({r.get('ma_can_ho') or '-'})"))
                 self.tbl_detail.setItem(i, 5, QTableWidgetItem(str(r.get("thoi_gian_vao") or "")))
+
+
+def _fmt_vnd(val: Any) -> str:
+    try:
+        return f"{int(round(float(val or 0))):,} đ".replace(",", ".")
+    except (TypeError, ValueError):
+        return "0 đ"
+
+
+class ManagerStatsView(QWidget):
+    """Màn hình 1.8 (Quản lý) & 4.7 (Admin Read-Only): Thống kê lượt xe, cư dân vs vãng lai & doanh thu."""
+
+    def __init__(
+        self,
+        socket_client: Optional[SocketClient] = None,
+        read_only: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.socket_client = socket_client
+        self.read_only = read_only
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        if self.read_only:
+            root.addWidget(ReadOnlyBanner(self))
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        lbl_title = QLabel("Thống kê Lượt xe & Doanh thu Bãi xe (1.8)")
+        lbl_title.setStyleSheet(
+            f"font-family: {Fonts.HEADING_FAMILY}; font-size: 21px; font-weight: 700; color: {Colors.TEXT_PRIMARY};"
+        )
+        self.lbl_sub = QLabel("Biểu đồ tổng hợp lượt vào/ra, cư dân vs vãng lai và cơ cấu doanh thu")
+        self.lbl_sub.setStyleSheet(f"font-size: 12.5px; color: {Colors.TEXT_MUTED};")
+        title_col.addWidget(lbl_title)
+        title_col.addWidget(self.lbl_sub)
+        header.addLayout(title_col, 1)
+
+        self.btn_refresh = QPushButton("Thống kê dữ liệu")
+        set_button_variant(self.btn_refresh, "primary", "md")
+        self.btn_refresh.clicked.connect(self.refresh_data)
+        header.addWidget(self.btn_refresh)
+        root.addLayout(header)
+
+        # Bộ lọc khoảng ngày / khu vực / loại xe / nhóm theo kỳ
+        filter_card = SectionCard(title="Bộ lọc kỳ thống kê")
+        f_row = QHBoxLayout()
+        f_row.setSpacing(10)
+
+        today = QDate.currentDate()
+        self.dt_start = QDateEdit(today.addDays(-30))
+        self.dt_start.setCalendarPopup(True)
+        self.dt_start.setDisplayFormat("yyyy-MM-dd")
+
+        self.dt_end = QDateEdit(today)
+        self.dt_end.setCalendarPopup(True)
+        self.dt_end.setDisplayFormat("yyyy-MM-dd")
+
+        self.cbo_zone = QComboBox()
+        self.cbo_zone.addItem("Tất cả khu vực", "")
+        self.cbo_zone.addItem("KHU_A (Xe máy)", "KHU_A")
+        self.cbo_zone.addItem("HAM_B1 (Ô tô Cư dân)", "HAM_B1")
+        self.cbo_zone.addItem("KHU_C (Ô tô Vãng lai)", "KHU_C")
+
+        self.cbo_vehicle_type = QComboBox()
+        self.cbo_vehicle_type.addItem("Tất cả loại xe", "")
+        self.cbo_vehicle_type.addItem("Ô tô (O_TO)", "O_TO")
+        self.cbo_vehicle_type.addItem("Xe máy (XE_MAY)", "XE_MAY")
+
+        self.cbo_group = QComboBox()
+        self.cbo_group.addItem("Theo ngày", "day")
+        self.cbo_group.addItem("Theo tháng", "month")
+
+        f_row.addWidget(QLabel("Từ ngày:"))
+        f_row.addWidget(self.dt_start)
+        f_row.addWidget(QLabel("Đến ngày:"))
+        f_row.addWidget(self.dt_end)
+        f_row.addWidget(QLabel("Khu vực:"))
+        f_row.addWidget(self.cbo_zone)
+        f_row.addWidget(QLabel("Loại xe:"))
+        f_row.addWidget(self.cbo_vehicle_type)
+        f_row.addWidget(QLabel("Doanh thu:"))
+        f_row.addWidget(self.cbo_group)
+        f_row.addStretch(1)
+        filter_card.body_layout.addLayout(f_row)
+        root.addWidget(filter_card)
+
+        # 4 KPI Cards
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(12)
+        self.card_turns = StatCard("1.8.1 Tổng lượt xe (Vào / Ra)", "0 / 0", "Tổng lượt ghi nhận", Colors.ROYAL_BLUE)
+        self.card_ratio = StatCard("1.8.2 Cư dân / Vãng lai", "0 / 0", "So sánh lượt gửi", Colors.INDIGO)
+        self.card_rev_res = StatCard("1.8.3 Phí tháng Cư dân", "0 đ", "Giao dịch QR & Tiền mặt", Colors.EMERALD_TEAL)
+        self.card_rev_total = StatCard("1.8.3 Tổng doanh thu", "0 đ", "Vãng lai: 0 đ", Colors.SUCCESS)
+        for card in (self.card_turns, self.card_ratio, self.card_rev_res, self.card_rev_total):
+            kpi_row.addWidget(card, 1)
+        root.addLayout(kpi_row)
+
+        # 3 Tab biểu đồ Matplotlib + Bảng đối chiếu
+        self.tabs = QTabWidget()
+
+        # Tab 1: 1.8.1 Lượt xe vào/ra
+        tab1 = QWidget()
+        t1_lay = QVBoxLayout(tab1)
+        self.fig_turns = Figure(figsize=(7, 3.2), dpi=100, facecolor=Colors.BG_CARD)
+        self.canvas_turns = FigureCanvas(self.fig_turns)
+        self.tbl_turns = QTableWidget(0, 4)
+        self.tbl_turns.setHorizontalHeaderLabels(["Ngày", "Lượt vào", "Lượt ra", "Báo cáo ca"])
+        style_table(self.tbl_turns)
+        t1_lay.addWidget(self.canvas_turns, 3)
+        t1_lay.addWidget(self.tbl_turns, 2)
+        self.tabs.addTab(tab1, "1.8.1 Thống kê lượt xe")
+
+        # Tab 2: 1.8.2 Cư dân vs Vãng lai
+        tab2 = QWidget()
+        t2_lay = QVBoxLayout(tab2)
+        self.fig_compare = Figure(figsize=(7, 3.2), dpi=100, facecolor=Colors.BG_CARD)
+        self.canvas_compare = FigureCanvas(self.fig_compare)
+        self.tbl_compare = QTableWidget(0, 7)
+        self.tbl_compare.setHorizontalHeaderLabels(
+            ["Ngày", "Cư dân Ô tô", "Cư dân Xe máy", "Tổng Cư dân", "Vãng lai Ô tô", "Vãng lai Xe máy", "Tổng Vãng lai"]
+        )
+        style_table(self.tbl_compare)
+        t2_lay.addWidget(self.canvas_compare, 3)
+        t2_lay.addWidget(self.tbl_compare, 2)
+        self.tabs.addTab(tab2, "1.8.2 Cư dân vs Vãng lai")
+
+        # Tab 3: 1.8.3 Doanh thu
+        tab3 = QWidget()
+        t3_lay = QVBoxLayout(tab3)
+        self.fig_revenue = Figure(figsize=(7, 3.2), dpi=100, facecolor=Colors.BG_CARD)
+        self.canvas_revenue = FigureCanvas(self.fig_revenue)
+        self.tbl_revenue = QTableWidget(0, 4)
+        self.tbl_revenue.setHorizontalHeaderLabels(
+            ["Kỳ (Ngày/Tháng)", "Phí tháng Cư dân", "Thu khách Vãng lai", "Tổng doanh thu"]
+        )
+        style_table(self.tbl_revenue)
+        t3_lay.addWidget(self.canvas_revenue, 3)
+        t3_lay.addWidget(self.tbl_revenue, 2)
+        self.tabs.addTab(tab3, "1.8.3 Thống kê doanh thu")
+
+        root.addWidget(self.tabs, 1)
+
+    def refresh_data(self) -> None:
+        if self.socket_client is None or not self.socket_client.is_connected():
+            self.lbl_sub.setText("Chưa kết nối Server — không thể tải thống kê.")
+            return
+
+        payload = {
+            "start_date": self.dt_start.date().toString("yyyy-MM-dd"),
+            "end_date": self.dt_end.date().toString("yyyy-MM-dd"),
+            "ma_khu_vuc": str(self.cbo_zone.currentData() or ""),
+            "ma_loai_xe": str(self.cbo_vehicle_type.currentData() or ""),
+            "group_by": str(self.cbo_group.currentData() or "day"),
+        }
+        turns_resp = self.socket_client.call(Actions.STATS_VEHICLE_TURNS, payload)
+        cmp_resp = self.socket_client.call(Actions.STATS_RESIDENT_VS_VISITOR, payload)
+        rev_resp = self.socket_client.call(Actions.STATS_REVENUE, payload)
+
+        self.apply_stats_data(
+            turns_data=(turns_resp.get("data") or {}) if turns_resp.get("ok") else {},
+            compare_data=(cmp_resp.get("data") or {}) if cmp_resp.get("ok") else {},
+            revenue_data=(rev_resp.get("data") or {}) if rev_resp.get("ok") else {},
+        )
+
+    def apply_stats_data(
+        self,
+        turns_data: Dict[str, Any],
+        compare_data: Dict[str, Any],
+        revenue_data: Dict[str, Any],
+    ) -> None:
+        """Đổ dữ liệu 1.8.1–1.8.3 vào KPI, 3 biểu đồ Matplotlib và 3 bảng đối chiếu."""
+        # KPI
+        self.card_turns.set_value(
+            f"{turns_data.get('tong_luot_vao', 0)} / {turns_data.get('tong_luot_ra', 0)}",
+            f"Tổng: {turns_data.get('tong_luot', 0)} lượt vào & ra",
+        )
+        self.card_ratio.set_value(
+            f"{compare_data.get('tong_cu_dan', 0)} / {compare_data.get('tong_vang_lai', 0)}",
+            f"Ô tô VL: {compare_data.get('vang_lai_oto', 0)} · Xe máy VL: {compare_data.get('vang_lai_xemay', 0)}",
+        )
+        self.card_rev_res.set_value(
+            _fmt_vnd(revenue_data.get("doanh_thu_cu_dan", 0)),
+            "Phí tháng cư dân đã thanh toán",
+        )
+        self.card_rev_total.set_value(
+            _fmt_vnd(revenue_data.get("tong_doanh_thu", 0)),
+            f"Vãng lai: {_fmt_vnd(revenue_data.get('doanh_thu_vang_lai', 0))}",
+        )
+
+        # 1.8.1 Chart & Table
+        t_series = turns_data.get("series") or []
+        self.tbl_turns.setRowCount(len(t_series))
+        for i, row in enumerate(t_series):
+            self.tbl_turns.setItem(i, 0, QTableWidgetItem(str(row.get("ngay") or "")))
+            self.tbl_turns.setItem(i, 1, QTableWidgetItem(str(row.get("luot_vao") or 0)))
+            self.tbl_turns.setItem(i, 2, QTableWidgetItem(str(row.get("luot_ra") or 0)))
+            self.tbl_turns.setItem(i, 3, QTableWidgetItem(str(row.get("bao_cao_ca") or 0)))
+
+        self.fig_turns.clear()
+        ax1 = self.fig_turns.add_subplot(111)
+        ax1.set_facecolor(Colors.BG_CARD)
+        if t_series:
+            labels = [str(x.get("ngay") or "") for x in t_series]
+            xs = list(range(len(labels)))
+            in_vals = [int(x.get("luot_vao") or 0) for x in t_series]
+            out_vals = [int(x.get("luot_ra") or 0) for x in t_series]
+            w = 0.36
+            ax1.bar([x - w / 2 for x in xs], in_vals, width=w, label="Lượt vào", color=Colors.ROYAL_BLUE)
+            ax1.bar([x + w / 2 for x in xs], out_vals, width=w, label="Lượt ra", color=Colors.EMERALD_TEAL)
+            ax1.set_xticks(xs)
+            ax1.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+            ax1.legend(frameon=False)
+        else:
+            ax1.text(0.5, 0.5, "Chưa có dữ liệu lượt xe trong kỳ", ha="center", va="center", color=Colors.TEXT_MUTED)
+        ax1.set_title("Biểu đồ Lượt Xe Vào / Ra (1.8.1)", fontsize=11, fontweight="bold", color=Colors.TEXT_PRIMARY)
+        ax1.grid(axis="y", linestyle="--", alpha=0.35)
+        self.fig_turns.tight_layout()
+        self.canvas_turns.draw()
+
+        # 1.8.2 Chart & Table
+        c_series = compare_data.get("series") or []
+        self.tbl_compare.setRowCount(len(c_series))
+        for i, row in enumerate(c_series):
+            self.tbl_compare.setItem(i, 0, QTableWidgetItem(str(row.get("ngay") or "")))
+            self.tbl_compare.setItem(i, 1, QTableWidgetItem(str(row.get("cu_dan_oto") or 0)))
+            self.tbl_compare.setItem(i, 2, QTableWidgetItem(str(row.get("cu_dan_xemay") or 0)))
+            self.tbl_compare.setItem(i, 3, QTableWidgetItem(str(row.get("cu_dan_tong") or 0)))
+            self.tbl_compare.setItem(i, 4, QTableWidgetItem(str(row.get("vang_lai_oto") or 0)))
+            self.tbl_compare.setItem(i, 5, QTableWidgetItem(str(row.get("vang_lai_xemay") or 0)))
+            self.tbl_compare.setItem(i, 6, QTableWidgetItem(str(row.get("vang_lai_tong") or 0)))
+
+        self.fig_compare.clear()
+        ax2 = self.fig_compare.add_subplot(111)
+        ax2.set_facecolor(Colors.BG_CARD)
+        if c_series:
+            labels = [str(x.get("ngay") or "") for x in c_series]
+            xs = list(range(len(labels)))
+            cd_vals = [int(x.get("cu_dan_tong") or 0) for x in c_series]
+            vl_vals = [int(x.get("vang_lai_tong") or 0) for x in c_series]
+            w = 0.36
+            ax2.bar([x - w / 2 for x in xs], cd_vals, width=w, label="Cư dân", color=Colors.INDIGO)
+            ax2.bar([x + w / 2 for x in xs], vl_vals, width=w, label="Khách vãng lai", color=Colors.WARNING)
+            ax2.set_xticks(xs)
+            ax2.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+            ax2.legend(frameon=False)
+        else:
+            ax2.text(0.5, 0.5, "Chưa có dữ liệu so sánh", ha="center", va="center", color=Colors.TEXT_MUTED)
+        ax2.set_title("So sánh Xe Cư dân vs Khách Vãng lai (1.8.2)", fontsize=11, fontweight="bold", color=Colors.TEXT_PRIMARY)
+        ax2.grid(axis="y", linestyle="--", alpha=0.35)
+        self.fig_compare.tight_layout()
+        self.canvas_compare.draw()
+
+        # 1.8.3 Chart & Table
+        r_series = revenue_data.get("series") or []
+        self.tbl_revenue.setRowCount(len(r_series))
+        for i, row in enumerate(r_series):
+            self.tbl_revenue.setItem(i, 0, QTableWidgetItem(str(row.get("period") or "")))
+            self.tbl_revenue.setItem(i, 1, QTableWidgetItem(_fmt_vnd(row.get("doanh_thu_cu_dan"))))
+            self.tbl_revenue.setItem(i, 2, QTableWidgetItem(_fmt_vnd(row.get("doanh_thu_vang_lai"))))
+            self.tbl_revenue.setItem(i, 3, QTableWidgetItem(_fmt_vnd(row.get("tong_doanh_thu"))))
+
+        self.fig_revenue.clear()
+        ax3 = self.fig_revenue.add_subplot(111)
+        ax3.set_facecolor(Colors.BG_CARD)
+        if r_series:
+            labels = [str(x.get("period") or "") for x in r_series]
+            xs = list(range(len(labels)))
+            cd_rev = [float(x.get("doanh_thu_cu_dan") or 0) for x in r_series]
+            vl_rev = [float(x.get("doanh_thu_vang_lai") or 0) for x in r_series]
+            tot_rev = [float(x.get("tong_doanh_thu") or 0) for x in r_series]
+            ax3.bar(xs, cd_rev, label="Phí tháng Cư dân", color=Colors.ROYAL_BLUE)
+            ax3.bar(xs, vl_rev, bottom=cd_rev, label="Khách vãng lai", color=Colors.EMERALD_TEAL)
+            ax3.plot(xs, tot_rev, color=Colors.SUCCESS, marker="o", linewidth=2, label="Tổng doanh thu")
+            ax3.set_xticks(xs)
+            ax3.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+            ax3.legend(frameon=False)
+        else:
+            ax3.text(0.5, 0.5, "Chưa có dữ liệu doanh thu", ha="center", va="center", color=Colors.TEXT_MUTED)
+        ax3.set_title("Cơ cấu Doanh thu Theo Kỳ (1.8.3)", fontsize=11, fontweight="bold", color=Colors.TEXT_PRIMARY)
+        ax3.grid(axis="y", linestyle="--", alpha=0.35)
+        self.fig_revenue.tight_layout()
+        self.canvas_revenue.draw()
