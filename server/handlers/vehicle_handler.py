@@ -886,6 +886,354 @@ class VehicleHandler:
             "preallocated_slots": preallocated_rows,
         }
 
+    # ==========================================================================
+    # 1.4.2 (Workflow 05): QUẢN LÝ DUYỆT YÊU CẦU PHƯƠNG TIỆN & PHÂN BỔ Ô ĐỖ ACID
+    # ==========================================================================
+    def _upsert_vehicle_tracking(
+        self,
+        tx: Any,
+        ma_phuong_tien: int,
+        ma_vi_tri_co_dinh: Optional[str],
+        ma_khu_vuc_phan_cong: Optional[str],
+    ) -> None:
+        existing = tx.fetch_one(
+            "SELECT ma_quan_ly_xe FROM quan_ly_phuong_tien_ra_vao WHERE ma_phuong_tien = %s FOR UPDATE",
+            (ma_phuong_tien,),
+        )
+        if existing:
+            tx.execute(
+                """
+                UPDATE quan_ly_phuong_tien_ra_vao
+                SET ma_vi_tri_co_dinh = %s,
+                    ma_khu_vuc_phan_cong = %s,
+                    dang_trong_bai = FALSE
+                WHERE ma_phuong_tien = %s
+                """,
+                (ma_vi_tri_co_dinh, ma_khu_vuc_phan_cong, ma_phuong_tien),
+            )
+        else:
+            tx.execute(
+                """
+                INSERT INTO quan_ly_phuong_tien_ra_vao (
+                    ma_phuong_tien, ma_vi_tri_co_dinh, ma_khu_vuc_phan_cong, dang_trong_bai
+                ) VALUES (%s, %s, %s, FALSE)
+                """,
+                (ma_phuong_tien, ma_vi_tri_co_dinh, ma_khu_vuc_phan_cong),
+            )
+
+    def handle_approve_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.2: Duyệt yêu cầu phương tiện (đăng ký mới / sửa thông tin / ngừng đăng ký) trong 1 TX ACID."""
+        try:
+            ma_yeu_cau_xe = int(payload.get("ma_yeu_cau_xe") or payload.get("ma_yeu_cau_dang_ky"))
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_yeu_cau_xe`.") from exc
+
+        ma_vi_tri = str(payload.get("ma_vi_tri_co_dinh") or payload.get("ma_vi_tri") or "").strip().upper() or None
+        ma_khu_vuc = str(payload.get("ma_khu_vuc_phan_cong") or payload.get("ma_khu_vuc") or "").strip().upper() or None
+        ly_do_phan_hoi = str(payload.get("ly_do_phan_hoi") or "Đã phê duyệt").strip()
+
+        db = self._db()
+        with db.transaction() as tx:
+            staff_id = self._resolve_staff_id(tx, session)
+            req = tx.fetch_one(
+                """
+                SELECT yc.*, cd.ma_can_ho,
+                       pt.ma_loai_xe, pt.bien_so_xe, pt.ten_hang_dong_xe,
+                       pt.mau_xe, pt.duong_dan_cavet, pt.trang_thai_xe
+                FROM yeu_cau_dang_ky_xe yc
+                JOIN cu_dan cd ON cd.ma_cu_dan = yc.ma_cu_dan
+                JOIN phuong_tien pt ON pt.ma_phuong_tien = yc.ma_phuong_tien
+                WHERE yc.ma_yeu_cau_xe = %s
+                FOR UPDATE OF yc
+                """,
+                (ma_yeu_cau_xe,),
+            )
+            if not req:
+                raise BusinessError(f"Không tìm thấy yêu cầu phương tiện #{ma_yeu_cau_xe}.")
+            if req["trang_thai_duyet"] != RequestStatus.CHO_DUYET.value:
+                raise BusinessError("Yêu cầu này đã được xử lý trước đó.")
+
+            loai_yeu_cau = str(req["loai_yeu_cau"])
+            ma_phuong_tien = int(req["ma_phuong_tien"])
+            ma_can_ho = str(req["ma_can_ho"])
+            ma_loai_xe = str(req["ma_loai_xe"])
+
+            assigned_slot_code: Optional[str] = None
+            assigned_zone_code: Optional[str] = None
+
+            if loai_yeu_cau == VehicleRequestTypes.DANG_KY_MOI.value:
+                dup = tx.fetch_one(
+                    """
+                    SELECT ma_phuong_tien
+                    FROM phuong_tien
+                    WHERE bien_so_xe = %s AND trang_thai_xe = %s AND ma_phuong_tien <> %s
+                    """,
+                    (req["bien_so_xe"], VehicleStatus.DANG_HOAT_DONG.value, ma_phuong_tien),
+                )
+                if dup:
+                    raise BusinessError(f"Biển số '{req['bien_so_xe']}' đang hoạt động ở hồ sơ khác.")
+
+                if ma_loai_xe == VehicleTypes.O_TO.value:
+                    if not ma_vi_tri:
+                        raise BusinessError("Vui lòng chọn ô đỗ ô tô cố định trên sơ đồ trước khi duyệt.")
+
+                    apartment = tx.fetch_one(
+                        "SELECT * FROM can_ho WHERE ma_can_ho = %s FOR UPDATE",
+                        (ma_can_ho,),
+                    )
+                    quota = self._get_apartment_quota_stats(tx, ma_can_ho, apartment)
+                    if quota["so_oto_dang_hoat_dong"] >= quota["tong_suat_oto"]:
+                        raise BusinessError(
+                            f"Căn hộ {ma_can_ho} đã hết hạn mức chỗ đỗ ô tô "
+                            f"({quota['so_oto_dang_hoat_dong']}/{quota['tong_suat_oto']}). "
+                            "Vui lòng duyệt yêu cầu mua thêm chỗ đỗ trước."
+                        )
+
+                    slot_row = tx.fetch_one(
+                        """
+                        SELECT vt.*, kv.ma_loai_xe, kv.trang_thai_khu_vuc
+                        FROM vi_tri_do vt
+                        JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+                        WHERE vt.ma_vi_tri = %s
+                        FOR UPDATE OF vt
+                        """,
+                        (ma_vi_tri,),
+                    )
+                    if not slot_row:
+                        raise BusinessError(f"Không tìm thấy vị trí đỗ '{ma_vi_tri}'.")
+                    if slot_row["ma_loai_xe"] != VehicleTypes.O_TO.value:
+                        raise BusinessError(f"Vị trí '{ma_vi_tri}' không thuộc khu vực ô tô.")
+                    if slot_row["trang_thai_khu_vuc"] != ZoneStatus.HOAT_DONG.value:
+                        raise BusinessError(f"Khu vực của vị trí '{ma_vi_tri}' đang ngừng sử dụng.")
+                    if slot_row["nhom_vi_tri"] == "vi_tri_vang_lai":
+                        raise BusinessError(f"Vị trí '{ma_vi_tri}' dành cho khách vãng lai, không gán cố định.")
+
+                    prealloc = tx.fetch_one(
+                        """
+                        SELECT pb.ma_phan_bo, pb.loai_cho_cap
+                        FROM phan_bo_cho_do pb
+                        LEFT JOIN quan_ly_phuong_tien_ra_vao ql
+                               ON ql.ma_vi_tri_co_dinh = pb.ma_vi_tri
+                        WHERE pb.ma_can_ho = %s
+                          AND pb.ma_vi_tri = %s
+                          AND pb.trang_thai_su_dung = %s
+                          AND ql.ma_quan_ly_xe IS NULL
+                        FOR UPDATE OF pb
+                        """,
+                        (ma_can_ho, ma_vi_tri, SlotAllocationStatus.DANG_HIEU_LUC.value),
+                    )
+
+                    if prealloc:
+                        if slot_row["trang_thai_vi_tri"] == SlotStatus.NGUNG_SU_DUNG.value:
+                            raise BusinessError(f"Vị trí '{ma_vi_tri}' đang ngừng sử dụng.")
+                    else:
+                        if slot_row["trang_thai_vi_tri"] != SlotStatus.TRONG.value:
+                            raise BusinessError(
+                                f"Vị trí '{ma_vi_tri}' hiện ở trạng thái '{slot_row['trang_thai_vi_tri']}', "
+                                "không thể phân bổ mới."
+                            )
+                        has_default = tx.fetch_one(
+                            """
+                            SELECT ma_phan_bo
+                            FROM phan_bo_cho_do
+                            WHERE ma_can_ho = %s
+                              AND loai_cho_cap = %s
+                              AND trang_thai_su_dung = %s
+                            """,
+                            (
+                                ma_can_ho,
+                                SlotAllocationTypes.CHO_MAC_DINH_XE_1.value,
+                                SlotAllocationStatus.DANG_HIEU_LUC.value,
+                            ),
+                        )
+                        loai_cho_cap = (
+                            SlotAllocationTypes.CHO_MUA_THEM.value
+                            if has_default
+                            else SlotAllocationTypes.CHO_MAC_DINH_XE_1.value
+                        )
+                        tx.execute(
+                            """
+                            INSERT INTO phan_bo_cho_do (
+                                ma_can_ho, ma_vi_tri, loai_cho_cap, trang_thai_su_dung
+                            ) VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                ma_can_ho,
+                                ma_vi_tri,
+                                loai_cho_cap,
+                                SlotAllocationStatus.DANG_HIEU_LUC.value,
+                            ),
+                        )
+                        tx.execute(
+                            """
+                            UPDATE vi_tri_do
+                            SET trang_thai_vi_tri = %s, thoi_gian_cap_nhat = CURRENT_TIMESTAMP
+                            WHERE ma_vi_tri = %s
+                            """,
+                            (SlotStatus.DA_PHAN_CHO.value, ma_vi_tri),
+                        )
+
+                    assigned_slot_code = ma_vi_tri
+                    assigned_zone_code = str(slot_row["ma_khu_vuc"])
+                    tx.execute(
+                        "UPDATE phuong_tien SET trang_thai_xe = %s WHERE ma_phuong_tien = %s",
+                        (VehicleStatus.DANG_HOAT_DONG.value, ma_phuong_tien),
+                    )
+                    self._upsert_vehicle_tracking(
+                        tx,
+                        ma_phuong_tien=ma_phuong_tien,
+                        ma_vi_tri_co_dinh=assigned_slot_code,
+                        ma_khu_vuc_phan_cong=assigned_zone_code,
+                    )
+
+                else:  # XE_MAY
+                    if not ma_khu_vuc:
+                        raise BusinessError("Vui lòng chọn khu vực đỗ xe máy trước khi duyệt.")
+                    zone_row = tx.fetch_one(
+                        "SELECT * FROM khu_vuc WHERE ma_khu_vuc = %s",
+                        (ma_khu_vuc,),
+                    )
+                    if not zone_row:
+                        raise BusinessError(f"Không tìm thấy khu vực '{ma_khu_vuc}'.")
+                    if zone_row["ma_loai_xe"] != VehicleTypes.XE_MAY.value:
+                        raise BusinessError(f"Khu vực '{ma_khu_vuc}' không dành cho xe máy.")
+                    if zone_row["trang_thai_khu_vuc"] != ZoneStatus.HOAT_DONG.value:
+                        raise BusinessError(f"Khu vực '{ma_khu_vuc}' đang ngừng sử dụng.")
+
+                    assigned_zone_code = ma_khu_vuc
+                    tx.execute(
+                        "UPDATE phuong_tien SET trang_thai_xe = %s WHERE ma_phuong_tien = %s",
+                        (VehicleStatus.DANG_HOAT_DONG.value, ma_phuong_tien),
+                    )
+                    self._upsert_vehicle_tracking(
+                        tx,
+                        ma_phuong_tien=ma_phuong_tien,
+                        ma_vi_tri_co_dinh=None,
+                        ma_khu_vuc_phan_cong=assigned_zone_code,
+                    )
+
+            elif loai_yeu_cau == VehicleRequestTypes.CHINH_SUA_THONG_TIN.value:
+                raw_changes = str(req.get("noi_dung_thay_doi") or "{}").strip()
+                try:
+                    changes = json.loads(raw_changes) if raw_changes.startswith("{") else {}
+                except json.JSONDecodeError:
+                    changes = {}
+
+                new_plate = str(changes.get("bien_so_xe") or req["bien_so_xe"]).strip()
+                new_ten = str(changes.get("ten_hang_dong_xe") or req["ten_hang_dong_xe"]).strip()
+                new_mau = changes.get("mau_xe") if "mau_xe" in changes else req.get("mau_xe")
+                new_cavet = str(changes.get("duong_dan_cavet") or req["duong_dan_cavet"]).strip()
+
+                if new_plate != req["bien_so_xe"]:
+                    dup = tx.fetch_one(
+                        "SELECT ma_phuong_tien FROM phuong_tien WHERE bien_so_xe = %s AND ma_phuong_tien <> %s",
+                        (new_plate, ma_phuong_tien),
+                    )
+                    if dup:
+                        raise BusinessError(f"Biển số mới '{new_plate}' đã bị sử dụng.")
+
+                tx.execute(
+                    """
+                    UPDATE phuong_tien
+                    SET bien_so_xe = %s,
+                        ten_hang_dong_xe = %s,
+                        mau_xe = %s,
+                        duong_dan_cavet = %s
+                    WHERE ma_phuong_tien = %s
+                    """,
+                    (new_plate, new_ten, new_mau, new_cavet, ma_phuong_tien),
+                )
+
+            elif loai_yeu_cau == VehicleRequestTypes.NGUNG_DANG_KY.value:
+                tracking = tx.fetch_one(
+                    "SELECT * FROM quan_ly_phuong_tien_ra_vao WHERE ma_phuong_tien = %s FOR UPDATE",
+                    (ma_phuong_tien,),
+                )
+                if tracking and bool(tracking.get("dang_trong_bai")):
+                    raise BusinessError(
+                        f"Xe '{req['bien_so_xe']}' đang đỗ trong bãi, không thể duyệt ngừng đăng ký!"
+                    )
+
+                tx.execute(
+                    "UPDATE phuong_tien SET trang_thai_xe = %s WHERE ma_phuong_tien = %s",
+                    (VehicleStatus.NGUNG_HOAT_DONG.value, ma_phuong_tien),
+                )
+                old_slot = tracking.get("ma_vi_tri_co_dinh") if tracking else None
+                if tracking:
+                    tx.execute(
+                        """
+                        UPDATE quan_ly_phuong_tien_ra_vao
+                        SET ma_vi_tri_co_dinh = NULL, ma_khu_vuc_phan_cong = NULL
+                        WHERE ma_phuong_tien = %s
+                        """,
+                        (ma_phuong_tien,),
+                    )
+                if old_slot:
+                    alloc = tx.fetch_one(
+                        """
+                        SELECT ma_phan_bo, loai_cho_cap
+                        FROM phan_bo_cho_do
+                        WHERE ma_can_ho = %s AND ma_vi_tri = %s AND trang_thai_su_dung = %s
+                        FOR UPDATE
+                        """,
+                        (ma_can_ho, old_slot, SlotAllocationStatus.DANG_HIEU_LUC.value),
+                    )
+                    if alloc and alloc["loai_cho_cap"] == SlotAllocationTypes.CHO_MAC_DINH_XE_1.value:
+                        tx.execute(
+                            """
+                            UPDATE phan_bo_cho_do
+                            SET trang_thai_su_dung = %s, ly_do_thu_hoi = %s
+                            WHERE ma_phan_bo = %s
+                            """,
+                            (
+                                SlotAllocationStatus.DA_THU_HOI.value,
+                                "Cư dân ngừng đăng ký xe mặc định",
+                                alloc["ma_phan_bo"],
+                            ),
+                        )
+                        tx.execute(
+                            """
+                            UPDATE vi_tri_do
+                            SET trang_thai_vi_tri = %s, thoi_gian_cap_nhat = CURRENT_TIMESTAMP
+                            WHERE ma_vi_tri = %s
+                            """,
+                            (SlotStatus.TRONG.value, old_slot),
+                        )
+
+            updated_req = tx.execute_returning(
+                """
+                UPDATE yeu_cau_dang_ky_xe
+                SET trang_thai_duyet = %s,
+                    ma_nhan_vien_duyet = %s,
+                    ly_do_phan_hoi = %s
+                WHERE ma_yeu_cau_xe = %s
+                RETURNING *
+                """,
+                (RequestStatus.DA_DUYET.value, staff_id, ly_do_phan_hoi, ma_yeu_cau_xe),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="DUYET_YEU_CAU_PHUONG_TIEN",
+            doi_tuong="yeu_cau_dang_ky_xe",
+            ma_doi_tuong=ma_yeu_cau_xe,
+            gia_tri_cu={"trang_thai_duyet": RequestStatus.CHO_DUYET.value, "loai_yeu_cau": loai_yeu_cau},
+            gia_tri_moi={
+                "trang_thai_duyet": RequestStatus.DA_DUYET.value,
+                "ma_vi_tri_co_dinh": assigned_slot_code,
+                "ma_khu_vuc_phan_cong": assigned_zone_code,
+            },
+        )
+        return {
+            "request": updated_req,
+            "ma_vi_tri_co_dinh": assigned_slot_code,
+            "ma_khu_vuc_phan_cong": assigned_zone_code,
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -928,5 +1276,11 @@ def register_vehicle_routes(
         handler.handle_get_assignable,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
+    )
+    router.register(
+        Actions.VEHICLE_APPROVE_REQUEST,
+        handler.handle_approve_request,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
     )
     return handler
