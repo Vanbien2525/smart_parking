@@ -615,6 +615,204 @@ class NotifyHandler:
             "items": items,
         }
 
+    # ==========================================================================
+    # 2.7 & 3.6: HỘP THƯ THÔNG BÁO CỦA NHÂN VIÊN & CƯ DÂN
+    # ==========================================================================
+    def handle_my_inbox(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.7.1 & 3.6.1: Lấy hộp thư của tài khoản hiện tại; tự động cập nhật da_tiep_nhan."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên chưa xác thực tài khoản.")
+        uid = int(session.ma_tai_khoan)
+        only_unread = bool(payload.get("only_unread", False))
+        loai = str(payload.get("loai_thong_bao") or "").strip()
+        auto_ack = bool(payload.get("auto_ack", True))
+
+        db = self._db()
+        with db.transaction() as tx:
+            if auto_ack and session.vai_tro != Roles.ADMIN.value:
+                tx.execute(
+                    """
+                    UPDATE nguoi_nhan_thong_bao
+                    SET trang_thai_tiep_nhan = %s,
+                        thoi_gian_tiep_nhan = COALESCE(thoi_gian_tiep_nhan, CURRENT_TIMESTAMP)
+                    WHERE ma_tai_khoan_nhan = %s
+                      AND trang_thai_tiep_nhan = %s
+                    """,
+                    (
+                        NotifyAckStatus.DA_TIEP_NHAN.value,
+                        uid,
+                        NotifyAckStatus.CHUA_TIEP_NHAN.value,
+                    ),
+                )
+
+            rows = tx.fetch_all(
+                """
+                SELECT nn.ma_tiep_nhan,
+                       nn.ma_thong_bao,
+                       nn.ma_tai_khoan_nhan,
+                       nn.trang_thai_gui,
+                       nn.so_lan_gui_lai,
+                       nn.trang_thai_tiep_nhan,
+                       nn.da_doc,
+                       nn.thoi_gian_tiep_nhan,
+                       tb.tieu_de,
+                       tb.noi_dung,
+                       tb.loai_thong_bao,
+                       tb.muc_do,
+                       tb.nhom_nguoi_nhan,
+                       tb.thoi_gian_gui,
+                       COALESCE(nv.ho_ten, 'Ban Quản Lý') AS ten_nguoi_gui
+                FROM nguoi_nhan_thong_bao nn
+                JOIN thong_bao tb ON tb.ma_thong_bao = nn.ma_thong_bao
+                LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = tb.ma_nguoi_gui
+                WHERE nn.ma_tai_khoan_nhan = %s
+                ORDER BY
+                    (CASE WHEN tb.loai_thong_bao = 'khan_cap' OR tb.muc_do = 'khan_cap' THEN 0 ELSE 1 END) ASC,
+                    (CASE WHEN nn.da_doc = FALSE THEN 0 ELSE 1 END) ASC,
+                    tb.thoi_gian_gui DESC,
+                    nn.ma_tiep_nhan DESC
+                """,
+                (uid,),
+            )
+
+        filtered = rows
+        if only_unread:
+            filtered = [r for r in filtered if not bool(r.get("da_doc"))]
+        if loai:
+            filtered = [r for r in filtered if r.get("loai_thong_bao") == loai]
+
+        unread_count = sum(1 for r in rows if not bool(r.get("da_doc")))
+        emergency_unread = sum(
+            1
+            for r in rows
+            if not bool(r.get("da_doc"))
+            and (
+                r.get("loai_thong_bao") == NotifyTypes.KHAN_CAP.value
+                or r.get("muc_do") == NotifyLevels.KHAN_CAP.value
+            )
+        )
+        return {
+            "total": len(filtered),
+            "unread_count": unread_count,
+            "emergency_unread_count": emergency_unread,
+            "items": filtered,
+        }
+
+    def handle_get_detail(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.7.2 & 3.6.2: Xem chi tiết nội dung một thông báo thuộc hộp thư cá nhân."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên chưa xác thực tài khoản.")
+        uid = int(session.ma_tai_khoan)
+        raw_id = payload.get("ma_thong_bao")
+        if raw_id in (None, ""):
+            raise BusinessError("Thiếu `ma_thong_bao` để xem chi tiết.")
+        ma_thong_bao = int(raw_id)
+
+        db = self._db()
+        detail = db.fetch_one(
+            """
+            SELECT nn.ma_tiep_nhan,
+                   nn.ma_thong_bao,
+                   nn.ma_tai_khoan_nhan,
+                   nn.trang_thai_gui,
+                   nn.so_lan_gui_lai,
+                   nn.trang_thai_tiep_nhan,
+                   nn.da_doc,
+                   nn.thoi_gian_tiep_nhan,
+                   tb.tieu_de,
+                   tb.noi_dung,
+                   tb.loai_thong_bao,
+                   tb.muc_do,
+                   tb.nhom_nguoi_nhan,
+                   tb.thoi_gian_gui,
+                   COALESCE(nv.ho_ten, 'Ban Quản Lý') AS ten_nguoi_gui
+            FROM nguoi_nhan_thong_bao nn
+            JOIN thong_bao tb ON tb.ma_thong_bao = nn.ma_thong_bao
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = tb.ma_nguoi_gui
+            WHERE nn.ma_thong_bao = %s AND nn.ma_tai_khoan_nhan = %s
+            """,
+            (ma_thong_bao, uid),
+        )
+        if detail is None:
+            raise BusinessError("Không tìm thấy thông báo trong hộp thư của bạn.")
+        return {"notification": detail}
+
+    def handle_mark_read(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.7.3 & 3.6.3: Đánh dấu đã đọc (da_doc=TRUE) và xác nhận tiếp nhận."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên chưa xác thực tài khoản.")
+        uid = int(session.ma_tai_khoan)
+        mark_all = bool(payload.get("mark_all", False))
+        db = self._db()
+
+        if mark_all:
+            affected = db.execute(
+                """
+                UPDATE nguoi_nhan_thong_bao
+                SET da_doc = TRUE,
+                    trang_thai_tiep_nhan = %s,
+                    thoi_gian_tiep_nhan = COALESCE(thoi_gian_tiep_nhan, CURRENT_TIMESTAMP)
+                WHERE ma_tai_khoan_nhan = %s AND da_doc = FALSE
+                """,
+                (NotifyAckStatus.DA_TIEP_NHAN.value, uid),
+            )
+            return {"mark_all": True, "updated_count": affected}
+
+        raw_id = payload.get("ma_thong_bao")
+        if raw_id in (None, ""):
+            raise BusinessError("Thiếu `ma_thong_bao` để đánh dấu đã đọc.")
+        ma_thong_bao = int(raw_id)
+
+        updated = db.execute_returning(
+            """
+            UPDATE nguoi_nhan_thong_bao
+            SET da_doc = TRUE,
+                trang_thai_tiep_nhan = %s,
+                thoi_gian_tiep_nhan = COALESCE(thoi_gian_tiep_nhan, CURRENT_TIMESTAMP)
+            WHERE ma_thong_bao = %s AND ma_tai_khoan_nhan = %s
+            RETURNING ma_tiep_nhan, ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui,
+                      so_lan_gui_lai, trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+            """,
+            (NotifyAckStatus.DA_TIEP_NHAN.value, ma_thong_bao, uid),
+        )
+        if updated is None:
+            raise BusinessError("Không tìm thấy bản ghi thông báo của bạn để đánh dấu đã đọc.")
+        return {"recipient": updated}
+
+    def handle_ack_emergency(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Workflow 01 ACK: Xác nhận đã tiếp nhận thông báo khẩn cấp từ EmergencyDialog/Banner."""
+        if session.ma_tai_khoan is None:
+            raise BusinessError("Phiên chưa xác thực tài khoản.")
+        uid = int(session.ma_tai_khoan)
+        raw_id = payload.get("ma_thong_bao")
+        if raw_id in (None, ""):
+            raise BusinessError("Thiếu `ma_thong_bao` để xác nhận tiếp nhận.")
+        ma_thong_bao = int(raw_id)
+
+        db = self._db()
+        updated = db.execute_returning(
+            """
+            UPDATE nguoi_nhan_thong_bao
+            SET trang_thai_tiep_nhan = %s,
+                thoi_gian_tiep_nhan = COALESCE(thoi_gian_tiep_nhan, CURRENT_TIMESTAMP)
+            WHERE ma_thong_bao = %s AND ma_tai_khoan_nhan = %s
+            RETURNING ma_tiep_nhan, ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui,
+                      so_lan_gui_lai, trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+            """,
+            (NotifyAckStatus.DA_TIEP_NHAN.value, ma_thong_bao, uid),
+        )
+        if updated is None:
+            raise BusinessError("Không tìm thấy thông báo cần xác nhận tiếp nhận.")
+        return {"recipient": updated}
+
 
 def register_notify_routes(
     router: Router,
@@ -654,6 +852,34 @@ def register_notify_routes(
         handler.handle_list_sent,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_MY_INBOX,
+        handler.handle_my_inbox,
+        allowed_roles=[Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_GET_DETAIL,
+        handler.handle_get_detail,
+        allowed_roles=[Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_MARK_READ,
+        handler.handle_mark_read,
+        allowed_roles=[Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_ACK_EMERGENCY,
+        handler.handle_ack_emergency,
+        allowed_roles=[Roles.NHAN_VIEN.value, Roles.CU_DAN.value, Roles.QUAN_LY.value],
+        is_mutation=True,
         require_auth=True,
     )
     return handler
