@@ -1,13 +1,25 @@
 """Handler Hóa đơn Tháng, Thanh toán QR/Tiền mặt (Workflow 06) & Theo dõi Thu phí (3.5 & 1.7)."""
 
+import base64
+import io
 import re
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+import qrcode
 
 from server.core.file_logger import FileLogger
 from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession
-from shared.constants import InvoiceStatus, PricingGroups, PricingStatus, Roles, TransactionStatus
+from shared.constants import (
+    InvoiceStatus,
+    PaymentMethods,
+    PricingGroups,
+    PricingStatus,
+    Roles,
+    TransactionStatus,
+)
 from shared.protocol import Actions
 
 _KY_THU_RE = re.compile(r"^(0[1-9]|1[0-2])/\d{4}$")
@@ -439,6 +451,297 @@ class BillingHandler:
         self._assert_invoice_access(session, receipt)
         return {"receipt": receipt}
 
+    # ==========================================================================
+    # WORKFLOW 06: THANH TOÁN PHÍ HÀNG THÁNG (CHUYỂN KHOẢN QR & TIỀN MẶT)
+    # ==========================================================================
+    @staticmethod
+    def _render_qr_base64(qr_payload: str) -> str:
+        """Tạo ảnh PNG mã QR dạng Base64 bằng thư viện `qrcode`."""
+        qr = qrcode.QRCode(version=1, box_size=8, border=2)
+        qr.add_data(qr_payload)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    @staticmethod
+    def _make_receipt_code(prefix: str, ma_hoa_don: int) -> str:
+        return f"{prefix}-{ma_hoa_don}-{uuid.uuid4().hex[:6].upper()}"
+
+    def _resolve_staff_id(self, db_or_tx: Any, session: ClientSession) -> Optional[int]:
+        if session.ma_nhan_vien is not None:
+            return int(session.ma_nhan_vien)
+        if session.ma_tai_khoan is not None:
+            row = db_or_tx.fetch_one(
+                "SELECT ma_nhan_vien FROM nhan_vien WHERE ma_tai_khoan = %s",
+                (int(session.ma_tai_khoan),),
+            )
+            if row and row.get("ma_nhan_vien") is not None:
+                return int(row["ma_nhan_vien"])
+        return None
+
+    def handle_create_qr_payment(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Workflow 06 (Nhánh QR): Sinh mã QR ảo, ảnh PNG base64 & han_ma_qr (+5 phút)."""
+        ma_hoa_don = payload.get("ma_hoa_don")
+        if ma_hoa_don is None:
+            raise BusinessError("Thiếu `ma_hoa_don` để khởi tạo mã QR thanh toán.")
+
+        db = self._db()
+        inv = db.fetch_one("SELECT * FROM hoa_don_thang WHERE ma_hoa_don = %s", (int(ma_hoa_don),))
+        if not inv:
+            raise BusinessError(f"Không tìm thấy hóa đơn mã {ma_hoa_don}.")
+        self._assert_invoice_access(session, inv)
+        if inv.get("trang_thai_hoa_don") == InvoiceStatus.DA_THANH_TOAN.value:
+            raise BusinessError("Hóa đơn này đã được thanh toán trước đó.")
+
+        now = datetime.now()
+        ttl_seconds = int(payload.get("ttl_seconds") or 300)
+        expires_at = now + timedelta(seconds=max(10, ttl_seconds))
+        so_tien = float(inv.get("tong_tien_phai_thu") or 0)
+        qr_text = (
+            f"SMARTPARKING|HD={inv['ma_hoa_don']}|CANHO={inv['ma_can_ho']}"
+            f"|KY={inv['ky_thu_thang_nam']}|TIEN={int(round(so_tien))}|TS={int(now.timestamp())}"
+        )
+        qr_b64 = self._render_qr_base64(qr_text)
+
+        tx_row = db.execute_returning(
+            """
+            INSERT INTO giao_dich_thanh_toan (
+                ma_hoa_don, hinh_thuc_thanh_toan, so_tien_thanh_toan,
+                ma_qr, han_ma_qr, trang_thai_giao_dich, thoi_gian_giao_dich
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING ma_giao_dich, ma_hoa_don, hinh_thuc_thanh_toan, so_tien_thanh_toan,
+                      ma_qr, han_ma_qr, trang_thai_giao_dich
+            """,
+            (
+                int(ma_hoa_don),
+                PaymentMethods.CHUYEN_KHOAN_QR.value,
+                so_tien,
+                qr_text,
+                expires_at,
+                TransactionStatus.CHO_XAC_NHAN.value,
+                now,
+            ),
+        )
+        return {
+            "ma_giao_dich": tx_row["ma_giao_dich"],
+            "ma_hoa_don": int(ma_hoa_don),
+            "so_tien_thanh_toan": so_tien,
+            "ma_qr": qr_text,
+            "qr_image_base64": qr_b64,
+            "han_ma_qr": expires_at.isoformat(timespec="seconds"),
+            "expires_in_seconds": max(10, ttl_seconds),
+        }
+
+    def handle_complete_qr_payment(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Workflow 06 (Quét mã thanh toán? Yes -> Thành công | No -> Giao dịch lỗi/quá hạn)."""
+        ma_hoa_don = payload.get("ma_hoa_don")
+        if ma_hoa_don is None:
+            raise BusinessError("Thiếu `ma_hoa_don` để hoàn tất thanh toán QR.")
+        ket_qua = str(payload.get("ket_qua") or "thanh_cong").strip()
+        if ket_qua not in ("thanh_cong", "loi_qua_han"):
+            raise BusinessError("`ket_qua` phải là `thanh_cong` hoặc `loi_qua_han`.")
+        ma_giao_dich = payload.get("ma_giao_dich")
+        ly_do_loi = str(payload.get("ly_do_loi") or "Mã QR quá hạn hoặc giao dịch bị hủy").strip()
+
+        db = self._db()
+        now = datetime.now()
+
+        with db.transaction() as tx:
+            inv = tx.fetch_one("SELECT * FROM hoa_don_thang WHERE ma_hoa_don = %s", (int(ma_hoa_don),))
+            if not inv:
+                raise BusinessError(f"Không tìm thấy hóa đơn mã {ma_hoa_don}.")
+            self._assert_invoice_access(session, inv)
+            if inv.get("trang_thai_hoa_don") == InvoiceStatus.DA_THANH_TOAN.value:
+                raise BusinessError("Hóa đơn này đã được thanh toán trước đó.")
+
+            pending_tx = None
+            if ma_giao_dich is not None:
+                pending_tx = tx.fetch_one(
+                    "SELECT * FROM giao_dich_thanh_toan WHERE ma_giao_dich = %s AND ma_hoa_don = %s",
+                    (int(ma_giao_dich), int(ma_hoa_don)),
+                )
+
+            # Nếu chọn Yes nhưng mã QR đã hết hạn thì tự động chuyển về nhánh lỗi quá hạn
+            expired = False
+            if pending_tx and pending_tx.get("han_ma_qr") is not None:
+                han = pending_tx["han_ma_qr"]
+                if isinstance(han, str):
+                    han = datetime.fromisoformat(han)
+                if isinstance(han, datetime) and now > han:
+                    expired = True
+
+            if ket_qua == "thanh_cong" and not expired:
+                ma_bien_lai = self._make_receipt_code("BL-QR", int(ma_hoa_don))
+                if pending_tx:
+                    gd_row = tx.execute_returning(
+                        """
+                        UPDATE giao_dich_thanh_toan
+                        SET trang_thai_giao_dich = %s,
+                            ma_bien_lai = %s,
+                            ly_do_loi = NULL,
+                            thoi_gian_giao_dich = %s
+                        WHERE ma_giao_dich = %s
+                        RETURNING *
+                        """,
+                        (
+                            TransactionStatus.THANH_TOAN_THANH_CONG.value,
+                            ma_bien_lai,
+                            now,
+                            int(pending_tx["ma_giao_dich"]),
+                        ),
+                    )
+                else:
+                    gd_row = tx.execute_returning(
+                        """
+                        INSERT INTO giao_dich_thanh_toan (
+                            ma_hoa_don, hinh_thuc_thanh_toan, so_tien_thanh_toan,
+                            ma_bien_lai, trang_thai_giao_dich, thoi_gian_giao_dich
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            int(ma_hoa_don),
+                            PaymentMethods.CHUYEN_KHOAN_QR.value,
+                            float(inv.get("tong_tien_phai_thu") or 0),
+                            ma_bien_lai,
+                            TransactionStatus.THANH_TOAN_THANH_CONG.value,
+                            now,
+                        ),
+                    )
+                tx.execute(
+                    "UPDATE hoa_don_thang SET trang_thai_hoa_don = %s WHERE ma_hoa_don = %s",
+                    (InvoiceStatus.DA_THANH_TOAN.value, int(ma_hoa_don)),
+                )
+                result_status = InvoiceStatus.DA_THANH_TOAN.value
+            else:
+                reason = "Mã QR đã quá hạn 5 phút." if expired and ket_qua == "thanh_cong" else ly_do_loi
+                if pending_tx:
+                    gd_row = tx.execute_returning(
+                        """
+                        UPDATE giao_dich_thanh_toan
+                        SET trang_thai_giao_dich = %s,
+                            ly_do_loi = %s,
+                            thoi_gian_giao_dich = %s
+                        WHERE ma_giao_dich = %s
+                        RETURNING *
+                        """,
+                        (
+                            TransactionStatus.GIAO_DICH_LOI_QUA_HAN.value,
+                            reason,
+                            now,
+                            int(pending_tx["ma_giao_dich"]),
+                        ),
+                    )
+                else:
+                    gd_row = tx.execute_returning(
+                        """
+                        INSERT INTO giao_dich_thanh_toan (
+                            ma_hoa_don, hinh_thuc_thanh_toan, so_tien_thanh_toan,
+                            trang_thai_giao_dich, ly_do_loi, thoi_gian_giao_dich
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            int(ma_hoa_don),
+                            PaymentMethods.CHUYEN_KHOAN_QR.value,
+                            float(inv.get("tong_tien_phai_thu") or 0),
+                            TransactionStatus.GIAO_DICH_LOI_QUA_HAN.value,
+                            reason,
+                            now,
+                        ),
+                    )
+                result_status = str(inv.get("trang_thai_hoa_don") or InvoiceStatus.CHUA_THANH_TOAN.value)
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="THANH_TOAN_QR",
+            doi_tuong="hoa_don_thang",
+            ma_doi_tuong=int(ma_hoa_don),
+            gia_tri_cu={"trang_thai_hoa_don": inv.get("trang_thai_hoa_don")},
+            gia_tri_moi={
+                "trang_thai_hoa_don": result_status,
+                "trang_thai_giao_dich": gd_row.get("trang_thai_giao_dich"),
+                "ma_bien_lai": gd_row.get("ma_bien_lai"),
+            },
+        )
+        return {
+            "transaction": gd_row,
+            "trang_thai_hoa_don": result_status,
+            "success": result_status == InvoiceStatus.DA_THANH_TOAN.value,
+        }
+
+    def handle_confirm_cash_payment(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Workflow 06 (Nhánh Tiền mặt): Nhân viên/Quản lý thu tiền tại phòng bảo vệ & cấp biên lai."""
+        ma_hoa_don = payload.get("ma_hoa_don")
+        if ma_hoa_don is None:
+            raise BusinessError("Thiếu `ma_hoa_don` để xác nhận thu tiền mặt.")
+
+        db = self._db()
+        now = datetime.now()
+        with db.transaction() as tx:
+            inv = tx.fetch_one("SELECT * FROM hoa_don_thang WHERE ma_hoa_don = %s", (int(ma_hoa_don),))
+            if not inv:
+                raise BusinessError(f"Không tìm thấy hóa đơn mã {ma_hoa_don}.")
+            if inv.get("trang_thai_hoa_don") == InvoiceStatus.DA_THANH_TOAN.value:
+                raise BusinessError("Hóa đơn này đã được thanh toán trước đó.")
+
+            ma_nv_thu = self._resolve_staff_id(tx, session)
+            ma_bien_lai = self._make_receipt_code("BL-TM", int(ma_hoa_don))
+            so_tien = float(inv.get("tong_tien_phai_thu") or 0)
+
+            gd_row = tx.execute_returning(
+                """
+                INSERT INTO giao_dich_thanh_toan (
+                    ma_hoa_don, hinh_thuc_thanh_toan, so_tien_thanh_toan,
+                    ma_bien_lai, ma_nhan_vien_thu, trang_thai_giao_dich, thoi_gian_giao_dich
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    int(ma_hoa_don),
+                    PaymentMethods.TIEN_MAT.value,
+                    so_tien,
+                    ma_bien_lai,
+                    ma_nv_thu,
+                    TransactionStatus.THANH_TOAN_THANH_CONG.value,
+                    now,
+                ),
+            )
+            tx.execute(
+                "UPDATE hoa_don_thang SET trang_thai_hoa_don = %s WHERE ma_hoa_don = %s",
+                (InvoiceStatus.DA_THANH_TOAN.value, int(ma_hoa_don)),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="THU_TIEN_MAT_HOA_DON",
+            doi_tuong="hoa_don_thang",
+            ma_doi_tuong=int(ma_hoa_don),
+            gia_tri_cu={"trang_thai_hoa_don": inv.get("trang_thai_hoa_don")},
+            gia_tri_moi={
+                "trang_thai_hoa_don": InvoiceStatus.DA_THANH_TOAN.value,
+                "ma_bien_lai": ma_bien_lai,
+                "ma_nhan_vien_thu": ma_nv_thu,
+            },
+        )
+        return {
+            "transaction": gd_row,
+            "trang_thai_hoa_don": InvoiceStatus.DA_THANH_TOAN.value,
+            "ma_bien_lai": ma_bien_lai,
+        }
+
 
 def register_billing_routes(
     router: Router,
@@ -480,6 +783,27 @@ def register_billing_routes(
         handler.handle_get_receipt,
         allowed_roles=[Roles.CU_DAN.value, Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
         is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_CREATE_QR_PAYMENT,
+        handler.handle_create_qr_payment,
+        allowed_roles=[Roles.CU_DAN.value, Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_COMPLETE_QR_PAYMENT,
+        handler.handle_complete_qr_payment,
+        allowed_roles=[Roles.CU_DAN.value, Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.BILLING_CONFIRM_CASH_PAYMENT,
+        handler.handle_confirm_cash_payment,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value],
+        is_mutation=True,
         require_auth=True,
     )
     return handler
