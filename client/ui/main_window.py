@@ -48,6 +48,10 @@ from client.ui.resident.extra_slot_view import ExtraSlotView
 from client.ui.resident.resident_notify_view import ResidentNotifyView
 from client.ui.resident.vehicle_lookup_view import VehicleLookupView
 from client.ui.resident.vehicle_view import ResidentVehicleView
+from client.ui.staff.gate_in_view import GateInView
+from client.ui.staff.gate_out_view import GateOutView
+from client.ui.staff.shift_revenue_view import ShiftRevenueView
+from client.ui.staff.staff_lookup_view import StaffLookupView
 from client.ui.staff.staff_monitor_notify_view import (
     StaffMonitorView,
     StaffNotifyInboxView,
@@ -291,6 +295,13 @@ class MainWindow(QMainWindow):
         widget = self._pages.get(key)
         if widget is None:
             return
+        if self._current_key and self._current_key != key:
+            prev_widget = self._pages.get(self._current_key)
+            if prev_widget is not None and hasattr(prev_widget, "stop_camera"):
+                try:
+                    prev_widget.stop_camera()
+                except Exception:
+                    pass
         self._current_key = key
         self.stack.setCurrentWidget(widget)
         title, subtitle = self._page_titles.get(key, ("", ""))
@@ -433,6 +444,25 @@ class MainWindow(QMainWindow):
             park_tabs.addTab(ManagerHistoryView(socket_client=self.socket_client, read_only=True), "4.8.3 Lịch sử xe vào/ra")
             parking_ro = park_tabs
 
+        gate_in_view = ex.get("2.2_gate_in") or GateInView(socket_client=self.socket_client)
+        gate_out_view = ex.get("2.3_gate_out") or GateOutView(socket_client=self.socket_client)
+        shift_revenue_view = ex.get("2.4_shift_revenue") or ShiftRevenueView(socket_client=self.socket_client)
+        staff_lookup_view = ex.get("2.5_lookup") or StaffLookupView(socket_client=self.socket_client)
+        staff_monitor_view = ex.get("2.6_monitor") or StaffMonitorView(socket_client=self.socket_client)
+
+        def _sync_staff_views(_data: Any = None) -> None:
+            for target_view in (shift_revenue_view, staff_lookup_view, staff_monitor_view):
+                if hasattr(target_view, "refresh_data"):
+                    try:
+                        target_view.refresh_data()
+                    except Exception:
+                        pass
+
+        if hasattr(gate_in_view, "gate_entry_completed"):
+            gate_in_view.gate_entry_completed.connect(_sync_staff_views)
+        if hasattr(gate_out_view, "gate_exit_completed"):
+            gate_out_view.gate_exit_completed.connect(_sync_staff_views)
+
         specs = [
             ("2.1_profile", "2.1 Hồ sơ & Mật khẩu", "Tài khoản Nhân viên (2.1)",
              "Xem thông tin nhân viên trực bãi và đổi mật khẩu",
@@ -440,23 +470,23 @@ class MainWindow(QMainWindow):
              "TÀI KHOẢN & CA TRỰC"),
             ("2.2_gate_in", "2.2 Kiểm soát Xe vào", "Cổng Vào Ticketless & OCR (2.2)",
              "Quét biển số tự động và ghi nhận xe vào bãi",
-             ex.get("2.2_gate_in") or self._build_placeholder("2.2 Kiểm soát Xe vào", "Nhận diện biển số AI và cho xe vào bãi", "Thành viên 5 (Ny)"),
+             gate_in_view,
              "KIỂM SOÁT CỔNG"),
             ("2.3_gate_out", "2.3 Kiểm soát Xe ra", "Cổng Ra & Tính phí Vãng lai (2.3)",
              "Đối chiếu biển số ra và thu phí khách vãng lai",
-             ex.get("2.3_gate_out") or self._build_placeholder("2.3 Kiểm soát Xe ra", "Tính phí và xác nhận xe ra khỏi bãi", "Thành viên 5 (Ny)"),
+             gate_out_view,
              "KIỂM SOÁT CỔNG"),
             ("2.4_shift_revenue", "2.4 Tiền thu ca trực", "Đối chiếu Tiền thu Ca trực (2.4)",
-             "Tổng hợp lượt xe và doanh thu tiền mặt trong ca",
-             ex.get("2.4_shift_revenue") or self._build_placeholder("2.4 Tiền thu ca trực", "Thống kê tiền mặt thu trong ca trực", "Thành viên 5 (Ny)"),
+             "Tổng hợp lượt xe và doanh thu tiền mặt / QR trong ca",
+             shift_revenue_view,
              "KIỂM SOÁT CỔNG"),
             ("2.5_lookup", "2.5 Tra cứu xe bãi", "Tra cứu Phương tiện (2.5)",
-             "Tìm xe đang gửi theo biển số và vị trí đỗ",
-             ex.get("2.5_lookup") or self._build_placeholder("2.5 Tra cứu xe bãi", "Tìm kiếm nhanh biển số và vị trí xe", "Thành viên 5 (Ny)"),
+             "Tìm xe đang gửi theo biển số, vị trí đỗ và ảnh cổng vào/ra",
+             staff_lookup_view,
              "GIÁM SÁT & THÔNG BÁO"),
             ("2.6_monitor", "2.6 Giám sát bãi 2D/3D", "Giám sát Bãi xe 2D/3D (2.6)",
              "Theo dõi chỗ trống và trạng thái các ô đỗ theo thời gian thực",
-             ex.get("2.6_monitor") or StaffMonitorView(socket_client=self.socket_client),
+             staff_monitor_view,
              "GIÁM SÁT & THÔNG BÁO"),
             ("2.7_notify", "2.7 Thông báo khẩn cấp", "Hộp thư Thông báo Nhân viên (2.7)",
              "Nhận cảnh báo khẩn cấp, đọc chi tiết và xác nhận tiếp nhận",
@@ -689,13 +719,26 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
+    def _stop_all_cameras(self) -> None:
+        for page in self._pages.values():
+            if hasattr(page, "stop_camera"):
+                try:
+                    page.stop_camera()
+                except Exception:
+                    pass
+
     def _on_logout_clicked(self) -> None:
+        self._stop_all_cameras()
         if self.socket_client is not None and self.socket_client.is_connected():
             try:
                 self.socket_client.call(Actions.AUTH_LOGOUT, {}, timeout=4.0)
             except Exception:
                 pass
         self.logout_requested.emit()
+
+    def closeEvent(self, event: Any) -> None:
+        self._stop_all_cameras()
+        super().closeEvent(event)
 
     def load_initial_data(self) -> None:
         """Nạp dữ liệu ban đầu cho trang đầu tiên và các module con hỗ trợ refresh_data."""
