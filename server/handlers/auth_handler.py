@@ -1,6 +1,7 @@
 """Handler Xác thực (1.2, 2.1, 3.1, 4.1), OTP Email 4 bước & Quản lý Nhân sự (1.3)."""
 
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Optional, Tuple
 
 import bcrypt
 
@@ -46,6 +47,45 @@ def validate_new_password(new_password: str, confirm_password: str) -> str:
     if new_password != confirm_password:
         raise BusinessError("Mật khẩu xác nhận không khớp.")
     return new_password
+
+
+def parse_apartment_code(
+    ma_can_ho: str,
+    toa_nha: Optional[str] = None,
+    so_tang: Optional[Any] = None,
+) -> Tuple[str, str, int]:
+    """Chuẩn hóa mã căn hộ và tự động tách (ma_can_ho, toa_nha, so_tang)."""
+    code = (ma_can_ho or "").strip().upper()
+    if not code or len(code) > 20:
+        raise BusinessError("Mã căn hộ không hợp lệ (1–20 ký tự).")
+
+    parsed_tower = (toa_nha or "").strip().upper()
+    parsed_floor: Optional[int] = None
+    if so_tang not in (None, ""):
+        try:
+            parsed_floor = int(so_tang)
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Số tầng phải là số nguyên hợp lệ.") from exc
+
+    m = re.match(r"^([A-Z]+)(\d{1,3})(?:[-_]\d+)?$", code)
+    if m:
+        if not parsed_tower:
+            parsed_tower = m.group(1)
+        if parsed_floor is None:
+            raw_digits = m.group(2)
+            # Nếu dạng A101 (3 chữ số không dấu gạch) -> tầng 1; A12-05 -> tầng 12
+            if "-" not in code and "_" not in code and len(raw_digits) >= 3:
+                parsed_floor = int(raw_digits[:-2])
+            else:
+                parsed_floor = int(raw_digits)
+
+    if not parsed_tower:
+        alpha = re.match(r"^([A-Z]+)", code)
+        parsed_tower = alpha.group(1) if alpha else "A"
+    if parsed_floor is None or parsed_floor < 0:
+        parsed_floor = 1
+
+    return code, parsed_tower, parsed_floor
 
 
 class AuthHRHandler:
@@ -515,6 +555,116 @@ class AuthHRHandler:
         )
         return {"profile": new_profile}
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.3.1: TẠO TÀI KHOẢN CƯ DÂN (AUTO-UPSERT can_ho TRONG TX)
+    # ==========================================================================
+    def handle_create_resident(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.1: Tạo tài khoản cư dân mới, tự động upsert căn hộ nếu chưa tồn tại."""
+        ho_ten = str(payload.get("ho_ten") or "").strip()
+        so_cccd = str(payload.get("so_cccd") or "").strip()
+        dia_chi = str(payload.get("dia_chi") or "").strip()
+        raw_can_ho = str(payload.get("ma_can_ho") or "").strip()
+        email = str(payload.get("email") or "").strip().lower()
+        so_dien_thoai = str(payload.get("so_dien_thoai") or "").strip()
+        ten_dang_nhap = str(payload.get("ten_dang_nhap") or "").strip()
+        mat_khau = str(payload.get("mat_khau_ban_dau") or payload.get("mat_khau") or "")
+
+        if not ho_ten or not ten_dang_nhap:
+            raise BusinessError("Vui lòng nhập đầy đủ họ tên và tên đăng nhập.")
+        if not validate_cccd(so_cccd):
+            raise BusinessError("Số CCCD/CMND phải gồm 9 hoặc 12 chữ số.")
+        if not validate_phone(so_dien_thoai):
+            raise BusinessError("Số điện thoại không đúng định dạng Việt Nam.")
+        if not validate_email(email):
+            raise BusinessError("Địa chỉ email không hợp lệ.")
+        if len(mat_khau) < 6:
+            raise BusinessError("Mật khẩu ban đầu phải có ít nhất 6 ký tự.")
+
+        ma_can_ho, toa_nha, so_tang = parse_apartment_code(
+            raw_can_ho,
+            toa_nha=payload.get("toa_nha"),
+            so_tang=payload.get("so_tang"),
+        )
+
+        db = self._db()
+        pw_hash = hash_password(mat_khau)
+
+        with db.transaction() as tx:
+            dup_user = tx.fetch_one(
+                "SELECT ma_tai_khoan FROM tai_khoan WHERE ten_dang_nhap = %s",
+                (ten_dang_nhap,),
+            )
+            if dup_user:
+                raise BusinessError(f"Tên đăng nhập '{ten_dang_nhap}' đã tồn tại.")
+
+            self._check_unique_contact(tx, so_cccd=so_cccd, email=email)
+
+            existing_apt = tx.fetch_one(
+                "SELECT ma_can_ho, toa_nha, so_tang, so_cho_oto_mac_dinh, so_cho_oto_mua_them FROM can_ho WHERE ma_can_ho = %s",
+                (ma_can_ho,),
+            )
+            auto_created_apartment = False
+            if not existing_apt:
+                tx.execute(
+                    """
+                    INSERT INTO can_ho (
+                        ma_can_ho, toa_nha, so_tang,
+                        so_cho_oto_mac_dinh, so_cho_oto_mua_them, trang_thai_can_ho
+                    ) VALUES (%s, %s, %s, 1, 0, 'dang_su_dung')
+                    """,
+                    (ma_can_ho, toa_nha, so_tang),
+                )
+                auto_created_apartment = True
+
+            tk_row = tx.execute_returning(
+                """
+                INSERT INTO tai_khoan (ten_dang_nhap, mat_khau_bam, vai_tro, trang_thai)
+                VALUES (%s, %s, %s, %s)
+                RETURNING ma_tai_khoan, ten_dang_nhap, vai_tro, trang_thai, ngay_tao
+                """,
+                (ten_dang_nhap, pw_hash, Roles.CU_DAN.value, AccountStatus.HOAT_DONG.value),
+            )
+            ma_tai_khoan = int(tk_row["ma_tai_khoan"])
+
+            cd_row = tx.execute_returning(
+                """
+                INSERT INTO cu_dan (
+                    ma_tai_khoan, ma_can_ho, ho_ten, so_cccd, so_dien_thoai, email, dia_chi
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING ma_cu_dan, ma_tai_khoan, ma_can_ho, ho_ten, so_cccd, so_dien_thoai, email, dia_chi
+                """,
+                (ma_tai_khoan, ma_can_ho, ho_ten, so_cccd, so_dien_thoai, email, dia_chi or None),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="TAO_CU_DAN",
+            doi_tuong="tai_khoan",
+            ma_doi_tuong=ma_tai_khoan,
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "ten_dang_nhap": ten_dang_nhap,
+                "ma_can_ho": ma_can_ho,
+                "auto_created_apartment": auto_created_apartment,
+                "ho_ten": ho_ten,
+            },
+        )
+        return {
+            "resident": {
+                **cd_row,
+                "ten_dang_nhap": ten_dang_nhap,
+                "vai_tro": Roles.CU_DAN.value,
+                "trang_thai": AccountStatus.HOAT_DONG.value,
+                "toa_nha": toa_nha,
+                "so_tang": so_tang,
+            },
+            "auto_created_apartment": auto_created_apartment,
+        }
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -590,6 +740,13 @@ def register_auth_hr_routes(
         Actions.AUTH_UPDATE_PROFILE,
         handler.handle_update_profile,
         allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.CU_DAN.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_CREATE_RESIDENT,
+        handler.handle_create_resident,
+        allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
         require_auth=True,
     )
