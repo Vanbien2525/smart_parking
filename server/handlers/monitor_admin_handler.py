@@ -1,6 +1,8 @@
-"""Handler nghiệp vụ cho Dashboard Quản lý (1.1) và cụm Admin Read-Only (4.2, 4.3, 4.4)."""
+"""Handler nghiệp vụ cho Dashboard Quản lý (1.1), Admin (4.2–4.4), Giám sát/Thống kê/Lịch sử (1.6, 1.8, 1.9, 2.6)."""
 
+import base64
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from server.core.file_logger import FileLogger
@@ -1176,6 +1178,228 @@ class MonitorAdminHandler:
             "series": series,
         }
 
+    # ==========================================================================
+    # NHÓM 1.9: TRA CỨU LỊCH SỬ XE VÀO, XE RA & CHI TIẾT LƯỢT GỬI (MINH)
+    # ==========================================================================
+    @staticmethod
+    def _resolve_image_base64(value: Any) -> str:
+        """Trả về chuỗi Base64 của ảnh từ raw base64 hoặc đường dẫn file trên đĩa."""
+        if not value:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        if text.startswith("data:image/"):
+            return text.split(",", 1)[1] if "," in text else text
+        candidate = Path(text)
+        if candidate.is_file():
+            try:
+                return base64.b64encode(candidate.read_bytes()).decode("ascii")
+            except OSError:
+                return ""
+        # Nếu nằm tương đối dưới thư mục project/storage
+        rel = Path(__file__).resolve().parent.parent.parent / text
+        if rel.is_file():
+            try:
+                return base64.b64encode(rel.read_bytes()).decode("ascii")
+            except OSError:
+                return ""
+        return text
+
+    def _merged_parking_sessions(
+        self,
+        start_date: str = "",
+        end_date: str = "",
+        ma_khu_vuc: str = "",
+        bien_so_xe: str = "",
+        loai_khach: str = "",
+        ma_loai_xe: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Gộp các dòng log `dang_gui` và `da_ra_bai` cùng `ma_luot_gui` thành bản ghi đầy đủ."""
+        raw = self.file_logger.query_logs(
+            "parking_history",
+            start_date=start_date or None,
+            end_date=end_date or None,
+            limit=0,
+        )
+        # query_logs trả mới nhất trước -> duyệt đảo ngược (cũ -> mới) để dòng mới ghi đè đúng
+        merged: Dict[str, Dict[str, Any]] = {}
+        for rec in reversed(raw):
+            sid = str(rec.get("ma_luot_gui") or "").strip()
+            if not sid:
+                sid = f"AUTO-{rec.get('bien_so_xe', '')}-{rec.get('timestamp', '')}"
+            existing = merged.get(sid, {})
+            combined = dict(existing)
+            for k, v in rec.items():
+                if v not in (None, "") or k not in combined:
+                    combined[k] = v
+            merged[sid] = combined
+
+        plate_kw = bien_so_xe.strip().upper()
+        zone_kw = ma_khu_vuc.strip().upper()
+        guest_kw = loai_khach.strip().lower()
+        type_kw = ma_loai_xe.strip().upper()
+
+        results: List[Dict[str, Any]] = []
+        for item in merged.values():
+            if plate_kw and plate_kw not in str(item.get("bien_so_xe") or "").upper():
+                continue
+            if zone_kw and str(item.get("ma_khu_vuc") or "").upper() != zone_kw:
+                continue
+            if guest_kw and str(item.get("loai_khach") or "").lower() != guest_kw:
+                continue
+            if type_kw and str(item.get("ma_loai_xe") or "").upper() != type_kw:
+                continue
+            results.append(item)
+
+        results.sort(
+            key=lambda x: str(x.get("thoi_gian_vao") or x.get("timestamp") or ""),
+            reverse=True,
+        )
+        return results
+
+    def handle_history_entries(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.9.1: Xem lịch sử xe vào từ parking_history_*.jsonl."""
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip()
+        bien_so_xe = str(payload.get("bien_so_xe") or "").strip()
+        loai_khach = str(payload.get("loai_khach") or "").strip()
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip()
+        limit = int(payload.get("limit") or 200)
+
+        sessions = self._merged_parking_sessions(
+            start_date=start_date,
+            end_date=end_date,
+            ma_khu_vuc=ma_khu_vuc,
+            bien_so_xe=bien_so_xe,
+            loai_khach=loai_khach,
+            ma_loai_xe=ma_loai_xe,
+        )
+        items: List[Dict[str, Any]] = []
+        for s in sessions[:limit]:
+            items.append(
+                {
+                    "ma_luot_gui": s.get("ma_luot_gui") or "",
+                    "loai_khach": s.get("loai_khach") or "",
+                    "bien_so_xe": s.get("bien_so_xe") or "",
+                    "ma_loai_xe": s.get("ma_loai_xe") or "",
+                    "ma_khu_vuc": s.get("ma_khu_vuc") or "",
+                    "ma_vi_tri": s.get("ma_vi_tri") or "",
+                    "thoi_gian_vao": s.get("thoi_gian_vao") or s.get("timestamp") or "",
+                    "anh_vao": self._resolve_image_base64(s.get("anh_vao")),
+                    "ma_nhan_vien_vao": s.get("ma_nhan_vien_vao"),
+                    "trang_thai": s.get("trang_thai") or "dang_gui",
+                }
+            )
+        return {
+            "total": len(items),
+            "items": items,
+        }
+
+    def handle_history_exits(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.9.2: Xem lịch sử xe đã ra khỏi bãi kèm tiền thu và nhân viên xác nhận."""
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip()
+        bien_so_xe = str(payload.get("bien_so_xe") or "").strip()
+        loai_khach = str(payload.get("loai_khach") or "").strip()
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip()
+        limit = int(payload.get("limit") or 200)
+
+        sessions = self._merged_parking_sessions(
+            start_date=start_date,
+            end_date=end_date,
+            ma_khu_vuc=ma_khu_vuc,
+            bien_so_xe=bien_so_xe,
+            loai_khach=loai_khach,
+            ma_loai_xe=ma_loai_xe,
+        )
+        exited = [
+            s
+            for s in sessions
+            if s.get("trang_thai") == "da_ra_bai" or bool(s.get("thoi_gian_ra"))
+        ]
+        exited.sort(
+            key=lambda x: str(x.get("thoi_gian_ra") or x.get("timestamp") or ""),
+            reverse=True,
+        )
+
+        items: List[Dict[str, Any]] = []
+        for s in exited[:limit]:
+            items.append(
+                {
+                    "ma_luot_gui": s.get("ma_luot_gui") or "",
+                    "loai_khach": s.get("loai_khach") or "",
+                    "bien_so_xe": s.get("bien_so_xe") or "",
+                    "ma_loai_xe": s.get("ma_loai_xe") or "",
+                    "ma_khu_vuc": s.get("ma_khu_vuc") or "",
+                    "ma_vi_tri": s.get("ma_vi_tri") or "",
+                    "thoi_gian_vao": s.get("thoi_gian_vao") or "",
+                    "thoi_gian_ra": s.get("thoi_gian_ra") or s.get("timestamp") or "",
+                    "tien_thu": float(s.get("tien_thu") or 0),
+                    "anh_ra": self._resolve_image_base64(s.get("anh_ra")),
+                    "ma_nhan_vien_ra": s.get("ma_nhan_vien_ra"),
+                    "trang_thai": s.get("trang_thai") or "da_ra_bai",
+                }
+            )
+        return {
+            "total": len(items),
+            "items": items,
+        }
+
+    def handle_history_session_detail(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.9.3: Xem chi tiết lượt gửi theo `ma_luot_gui` kèm 2 ảnh đối chiếu vào/ra."""
+        ma_luot_gui = str(payload.get("ma_luot_gui") or "").strip()
+        if not ma_luot_gui:
+            raise BusinessError("Thiếu `ma_luot_gui` để xem chi tiết lượt gửi.")
+
+        sessions = self._merged_parking_sessions()
+        target = next((s for s in sessions if str(s.get("ma_luot_gui") or "") == ma_luot_gui), None)
+        if target is None:
+            # Kiểm tra thêm trong StateStore phòng trường hợp chưa ghi file log
+            for v in self.state_store.list_open_visitor_sessions():
+                if str(v.get("ma_luot_gui") or "") == ma_luot_gui:
+                    target = v
+                    break
+
+        if target is None:
+            raise BusinessError(f"Không tìm thấy lượt gửi '{ma_luot_gui}'.")
+
+        db = self._db()
+        nv_vao_name = ""
+        nv_ra_name = ""
+        if target.get("ma_nhan_vien_vao") is not None:
+            row_v = _safe_fetch_one(
+                db,
+                "SELECT ho_ten FROM nhan_vien WHERE ma_nhan_vien = %s",
+                (int(target["ma_nhan_vien_vao"]),),
+            )
+            nv_vao_name = str((row_v or {}).get("ho_ten") or "")
+        if target.get("ma_nhan_vien_ra") is not None:
+            row_r = _safe_fetch_one(
+                db,
+                "SELECT ho_ten FROM nhan_vien WHERE ma_nhan_vien = %s",
+                (int(target["ma_nhan_vien_ra"]),),
+            )
+            nv_ra_name = str((row_r or {}).get("ho_ten") or "")
+
+        detail = {
+            **target,
+            "anh_vao": self._resolve_image_base64(target.get("anh_vao")),
+            "anh_ra": self._resolve_image_base64(target.get("anh_ra")),
+            "ten_nhan_vien_vao": nv_vao_name,
+            "ten_nhan_vien_ra": nv_ra_name,
+            "tien_thu": float(target.get("tien_thu") or 0),
+        }
+        return {"session": detail}
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -1286,6 +1510,27 @@ def register_monitor_admin_routes(
         Actions.STATS_REVENUE,
         handler.handle_stats_revenue,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HISTORY_ENTRIES,
+        handler.handle_history_entries,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value, Roles.NHAN_VIEN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HISTORY_EXITS,
+        handler.handle_history_exits,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value, Roles.NHAN_VIEN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HISTORY_SESSION_DETAIL,
+        handler.handle_history_session_detail,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value, Roles.NHAN_VIEN.value],
         is_mutation=False,
         require_auth=True,
     )
