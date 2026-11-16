@@ -203,11 +203,18 @@ def _detect_plate_candidates_cv(frame_bgr: np.ndarray) -> List[Tuple[np.ndarray,
 class PlateRecognizer:
     """Bộ nhận diện biển số Hybrid 2 tầng dùng được cả đồng bộ lẫn trong QThread."""
 
+    _GEMINI_MAX_IMAGE_SIDE = 1024
+    _GEMINI_JPEG_QUALITY = 80
+    _GEMINI_TIMEOUT_MS = 12_000
+
     _easyocr_lock = threading.Lock()
     _easyocr_reader: Any = None
     _yolo_lock = threading.Lock()
     _yolo_model: Any = None
     _yolo_checked: bool = False
+    _genai_lock = threading.Lock()
+    _genai_clients: Dict[str, Any] = {}
+    _model_cooldowns: Dict[str, float] = {}
 
     def __init__(
         self,
@@ -216,8 +223,8 @@ class PlateRecognizer:
         fallback_model: Optional[str] = None,
     ) -> None:
         self.api_key = (api_key if api_key is not None else os.getenv("GEMINI_API_KEY", "")).strip()
-        self.primary_model = (primary_model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash")).strip()
-        self.fallback_model = (fallback_model or os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")).strip()
+        self.primary_model = (primary_model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")).strip()
+        self.fallback_model = (fallback_model or os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")).strip()
 
     @staticmethod
     def _is_valid_api_key(key: str) -> bool:
@@ -251,16 +258,100 @@ class PlateRecognizer:
                     cls._yolo_model = None
             return cls._yolo_model
 
+    @classmethod
+    def _get_genai_client(cls, genai_module: Any, types_module: Any, clean_key: str) -> Any:
+        """Tái sử dụng genai.Client theo API key và tắt retry ngầm để tránh treo 30s+ khi lỗi."""
+        with cls._genai_lock:
+            cached = cls._genai_clients.get(clean_key)
+            if cached is not None:
+                return cached
+
+            http_options = None
+            try:
+                retry_cls = getattr(types_module, "HttpRetryOptions", None)
+                http_cls = getattr(types_module, "HttpOptions", None)
+                if http_cls is not None and retry_cls is not None:
+                    http_options = http_cls(
+                        timeout=cls._GEMINI_TIMEOUT_MS,
+                        retry_options=retry_cls(attempts=1),
+                    )
+                elif http_cls is not None:
+                    http_options = http_cls(timeout=cls._GEMINI_TIMEOUT_MS)
+            except Exception:
+                http_options = None
+
+            client = (
+                genai_module.Client(api_key=clean_key, http_options=http_options)
+                if http_options is not None
+                else genai_module.Client(api_key=clean_key)
+            )
+            cls._genai_clients[clean_key] = client
+            return client
+
+    @classmethod
+    def _encode_frame_for_gemini(cls, frame_bgr: np.ndarray) -> Optional[bytes]:
+        """Resize ảnh về cạnh dài tối đa 1024px và nén JPEG để gửi Gemini nhanh hơn."""
+        if frame_bgr is None or frame_bgr.size == 0:
+            return None
+        h, w = frame_bgr.shape[:2]
+        max_dim = max(h, w)
+        target = frame_bgr
+        if max_dim > cls._GEMINI_MAX_IMAGE_SIDE:
+            scale = cls._GEMINI_MAX_IMAGE_SIDE / float(max_dim)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            target = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            target,
+            [int(cv2.IMWRITE_JPEG_QUALITY), cls._GEMINI_JPEG_QUALITY],
+        )
+        return encoded.tobytes() if ok else None
+
+    @staticmethod
+    def _build_gemini_config(types_module: Any, model_name: str, minimize_thinking: bool = True) -> Any:
+        """Tạo cấu hình GenerateContent tối ưu độ trễ cho OCR (giảm tối đa thinking tokens)."""
+        kwargs: Dict[str, Any] = {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "max_output_tokens": 256,
+        }
+        if minimize_thinking:
+            thinking_cls = getattr(types_module, "ThinkingConfig", None)
+            if thinking_cls is not None:
+                if "2.5" in model_name:
+                    kwargs["thinking_config"] = thinking_cls(thinking_budget=0)
+                else:
+                    level_enum = getattr(types_module, "ThinkingLevel", None)
+                    level_val = getattr(level_enum, "MINIMAL", "MINIMAL") if level_enum is not None else "MINIMAL"
+                    kwargs["thinking_config"] = thinking_cls(thinking_level=level_val)
+        return types_module.GenerateContentConfig(**kwargs)
+
+    @classmethod
+    def _mark_model_cooldown(cls, model_name: str, seconds: float) -> None:
+        with cls._genai_lock:
+            cls._model_cooldowns[model_name] = time.monotonic() + seconds
+
+    @classmethod
+    def _select_models_to_try(cls, primary_model: str, fallback_model: str) -> List[str]:
+        candidates = [m for m in (primary_model, fallback_model) if m]
+        # Loại trùng nhưng giữ nguyên thứ tự
+        unique_models = list(dict.fromkeys(candidates))
+        now = time.monotonic()
+        with cls._genai_lock:
+            active = [m for m in unique_models if now >= cls._model_cooldowns.get(m, 0.0)]
+        return active if active else unique_models
+
     def recognize_with_gemini_vision(self, frame_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
         """Tầng 1: Gọi Gemini Flash Vision API để đọc biển số, loại xe và bounding box."""
         clean_key = self.api_key.strip().strip('"').strip("'")
         if not self._is_valid_api_key(clean_key):
             return None
 
-        ok, encoded = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if not ok:
+        image_bytes = self._encode_frame_for_gemini(frame_bgr)
+        if not image_bytes:
             return None
-        image_bytes = encoded.tobytes()
 
         try:
             from google import genai
@@ -268,53 +359,52 @@ class PlateRecognizer:
         except Exception:
             return None
 
-        client = genai.Client(api_key=clean_key)
-        models_to_try = [self.primary_model]
-        if self.fallback_model and self.fallback_model != self.primary_model:
-            models_to_try.append(self.fallback_model)
+        client = self._get_genai_client(genai, types, clean_key)
+        models_to_try = self._select_models_to_try(self.primary_model, self.fallback_model)
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
 
         last_error: Optional[Exception] = None
         for model_name in models_to_try:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        _GEMINI_SYSTEM_PROMPT,
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
-                )
-                raw_json = (getattr(response, "text", None) or "").strip()
-                if not raw_json:
-                    continue
-                parsed = self._parse_gemini_json(raw_json)
-                raw_plate = str(parsed.get("bien_so") or "").strip()
-                if not raw_plate:
-                    continue
+            for minimize_thinking in (True, False):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[image_part, _GEMINI_SYSTEM_PROMPT],
+                        config=self._build_gemini_config(types, model_name, minimize_thinking=minimize_thinking),
+                    )
+                    raw_json = (getattr(response, "text", None) or "").strip()
+                    if not raw_json:
+                        break
+                    parsed = self._parse_gemini_json(raw_json)
+                    raw_plate = str(parsed.get("bien_so") or "").strip()
+                    if not raw_plate:
+                        break
 
-                plate, vtype = post_process_plate_text(raw_plate, parsed.get("loai_xe"))
-                confidence = float(parsed.get("confidence") or 0.95)
-                confidence = max(0.0, min(1.0, confidence))
-                crop_bgr = _crop_by_bbox(frame_bgr, parsed.get("bbox"))
-                return {
-                    "success": bool(plate),
-                    "bien_so": plate,
-                    "loai_xe": vtype,
-                    "confidence": confidence,
-                    "engine_used": f"Gemini Vision AI ({model_name})",
-                    "crop_bgr": crop_bgr,
-                    "raw_text": raw_plate,
-                }
-            except Exception as exc:
-                last_error = exc
-                err_txt = str(exc).lower()
-                # Chỉ chuyển model dự phòng khi gặp lỗi quota / 429 / unavailable; lỗi khác cũng fallback an toàn
-                if "429" in err_txt or "quota" in err_txt or "resource_exhausted" in err_txt:
-                    continue
-                continue
+                    plate, vtype = post_process_plate_text(raw_plate, parsed.get("loai_xe"))
+                    confidence = float(parsed.get("confidence") or 0.95)
+                    confidence = max(0.0, min(1.0, confidence))
+                    crop_bgr = _crop_by_bbox(frame_bgr, parsed.get("bbox"))
+                    return {
+                        "success": bool(plate),
+                        "bien_so": plate,
+                        "loai_xe": vtype,
+                        "confidence": confidence,
+                        "engine_used": f"Gemini Vision AI ({model_name})",
+                        "crop_bgr": crop_bgr,
+                        "raw_text": raw_plate,
+                    }
+                except Exception as exc:
+                    last_error = exc
+                    err_txt = str(exc).lower()
+                    # Nếu model không hỗ trợ thinking_config, thử lại ngay không truyền thinking_config
+                    if minimize_thinking and ("thinking" in err_txt or "400" in err_txt or "invalid_argument" in err_txt):
+                        continue
+                    if "429" in err_txt or "quota" in err_txt or "resource_exhausted" in err_txt:
+                        cooldown = 300.0 if ("per_day" in err_txt or "day" in err_txt) else 60.0
+                        self._mark_model_cooldown(model_name, cooldown)
+                    elif "404" in err_txt or "not_found" in err_txt or "not found" in err_txt:
+                        self._mark_model_cooldown(model_name, 600.0)
+                    break
 
         if last_error is not None:
             return None
