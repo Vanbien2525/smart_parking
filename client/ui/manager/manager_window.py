@@ -6,6 +6,9 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from client.network.socket_client import SocketClient
 from client.ui.manager.dashboard_view import DashboardView
+from client.ui.manager.finance_view import FinanceView
+from client.ui.manager.hr_view import HRView
+from client.ui.manager.infra_pricing_view import InfraPricingView
 from client.ui.theme.components import EmptyStateWidget
 from client.ui.theme.role_shell import RolePortalWindow
 
@@ -47,7 +50,24 @@ class ManagerWindow(RolePortalWindow):
             group_label="VẬN HÀNH & TỔNG QUAN",
         )
 
-        custom_views = extra_views or {}
+        custom_views = dict(extra_views or {})
+        self.hr_view = custom_views.get("1.3_staff_resident") or HRView(
+            socket_client=socket_client, read_only=False
+        )
+        self.infra_view = custom_views.get("1.4_slots") or InfraPricingView(
+            socket_client=socket_client, read_only=False, initial_tab=0
+        )
+        self.pricing_view = custom_views.get("1.5_pricing") or InfraPricingView(
+            socket_client=socket_client, read_only=False, initial_tab=2
+        )
+        self.finance_view = custom_views.get("1.7_billing") or FinanceView(
+            socket_client=socket_client, read_only=False
+        )
+        custom_views.setdefault("1.3_staff_resident", self.hr_view)
+        custom_views.setdefault("1.4_slots", self.infra_view)
+        custom_views.setdefault("1.5_pricing", self.pricing_view)
+        custom_views.setdefault("1.7_billing", self.finance_view)
+
         for key, label, desc, owner in _MANAGER_PLACEHOLDERS:
             widget = custom_views.get(key)
             if widget is None:
@@ -76,5 +96,8 @@ class ManagerWindow(RolePortalWindow):
         return host
 
     def load_initial_data(self) -> None:
-        """Nạp dữ liệu Dashboard qua TCP Socket khi mở cửa sổ Quản lý."""
+        """Nạp dữ liệu Dashboard & nghiệp vụ Quản lý qua TCP Socket."""
         self.dashboard_view.refresh_data()
+        for view in (self.hr_view, self.infra_view, self.pricing_view, self.finance_view):
+            if hasattr(view, "refresh_data"):
+                view.refresh_data()

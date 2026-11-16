@@ -2,7 +2,7 @@
 
 from typing import Dict, Optional
 
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QTabWidget, QWidget
 
 from client.network.socket_client import SocketClient
 from client.ui.admin.admin_views import (
@@ -12,6 +12,9 @@ from client.ui.admin.admin_views import (
     AdminSessionsView,
 )
 from client.ui.manager.dashboard_view import DashboardView
+from client.ui.manager.finance_view import FinanceView
+from client.ui.manager.hr_view import HRView
+from client.ui.manager.infra_pricing_view import InfraPricingView
 from client.ui.theme.role_shell import RolePortalWindow
 
 
@@ -73,7 +76,24 @@ class AdminWindow(RolePortalWindow):
             group_label="BÁO CÁO READ-ONLY (4.5–4.8)",
         )
 
-        custom_ro = extra_read_only_views or {}
+        custom_ro = dict(extra_read_only_views or {})
+        if "4.6_infra_ro" not in custom_ro:
+            infra_tabs = QTabWidget()
+            self.ro_hr_view = HRView(socket_client=socket_client, read_only=True)
+            self.ro_infra_pricing_view = InfraPricingView(socket_client=socket_client, read_only=True)
+            infra_tabs.addTab(self.ro_hr_view, "4.6.1 Nhân sự & Cư dân")
+            infra_tabs.addTab(self.ro_infra_pricing_view, "4.6.3–4.6.4 Khu vực, Vị trí & Bảng giá")
+            custom_ro["4.6_infra_ro"] = infra_tabs
+        else:
+            self.ro_hr_view = None
+            self.ro_infra_pricing_view = None
+
+        if "4.7_finance_ro" not in custom_ro:
+            self.ro_finance_view = FinanceView(socket_client=socket_client, read_only=True)
+            custom_ro["4.7_finance_ro"] = self.ro_finance_view
+        else:
+            self.ro_finance_view = None
+
         readonly_sections = (
             ("4.6_infra_ro", "4.6 Hạ tầng & Giá (Chỉ xem)", "Xem khu vực đỗ, vị trí đỗ, xe cư dân và bảng giá"),
             ("4.7_finance_ro", "4.7 Thống kê & Phí (Chỉ xem)", "Xem biểu đồ lượt xe, doanh thu và công nợ cư dân"),
@@ -102,3 +122,6 @@ class AdminWindow(RolePortalWindow):
         self.logs_view.refresh_log_type("error")
         if isinstance(self.dashboard_readonly_view.child_widget, DashboardView):
             self.dashboard_readonly_view.child_widget.refresh_data()
+        for ro_view in (self.ro_hr_view, self.ro_infra_pricing_view, self.ro_finance_view):
+            if ro_view is not None and hasattr(ro_view, "refresh_data"):
+                ro_view.refresh_data()
