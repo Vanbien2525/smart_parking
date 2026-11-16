@@ -531,6 +531,299 @@ class MonitorAdminHandler:
             "items": items,
         }
 
+    # ==========================================================================
+    # NHÓM 1.6 & 2.6: GIÁM SÁT BÃI XE 2D/3D (MINH)
+    # ==========================================================================
+    def _collect_active_parking_items(
+        self,
+        db: Any,
+        ma_khu_vuc: str = "",
+        bien_so_xe: str = "",
+        loai_khach: str = "",
+        ma_loai_xe: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Gộp danh sách xe cư dân đang trong bãi (CSDL) và xe vãng lai (StateStore)."""
+        items: List[Dict[str, Any]] = []
+        plate_filter = bien_so_xe.strip().upper()
+        zone_filter = ma_khu_vuc.strip().upper()
+        type_filter = ma_loai_xe.strip().upper()
+        guest_filter = loai_khach.strip().lower()
+
+        if guest_filter in ("", "cu_dan"):
+            resident_rows = _safe_fetch_all(
+                db,
+                """
+                SELECT ql.ma_quan_ly_xe,
+                       ql.ma_phuong_tien,
+                       COALESCE(v.ma_khu_vuc, ql.ma_khu_vuc_phan_cong) AS ma_khu_vuc,
+                       ql.ma_vi_tri_co_dinh AS ma_vi_tri,
+                       ql.thoi_gian_vao,
+                       pt.bien_so_xe,
+                       pt.ma_loai_xe,
+                       pt.ten_hang_dong_xe,
+                       pt.mau_xe,
+                       cd.ho_ten AS ten_chu_xe,
+                       cd.ma_can_ho
+                FROM quan_ly_phuong_tien_ra_vao ql
+                JOIN phuong_tien pt ON pt.ma_phuong_tien = ql.ma_phuong_tien
+                JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+                LEFT JOIN vi_tri_do v ON v.ma_vi_tri = ql.ma_vi_tri_co_dinh
+                WHERE ql.dang_trong_bai = TRUE
+                ORDER BY ql.thoi_gian_vao DESC NULLS LAST, pt.bien_so_xe ASC
+                """,
+            )
+            for row in resident_rows:
+                items.append(
+                    {
+                        "ma_luot_gui": f"CD-{row.get('ma_quan_ly_xe')}",
+                        "loai_khach": "cu_dan",
+                        "bien_so_xe": row.get("bien_so_xe") or "",
+                        "ma_loai_xe": row.get("ma_loai_xe") or "",
+                        "ma_khu_vuc": row.get("ma_khu_vuc") or "",
+                        "ma_vi_tri": row.get("ma_vi_tri") or "",
+                        "thoi_gian_vao": str(row.get("thoi_gian_vao") or ""),
+                        "ten_chu_xe": row.get("ten_chu_xe") or "",
+                        "ma_can_ho": row.get("ma_can_ho") or "",
+                        "ten_hang_dong_xe": row.get("ten_hang_dong_xe") or "",
+                    }
+                )
+
+        if guest_filter in ("", "vang_lai"):
+            visitor_rows = self.state_store.list_open_visitor_sessions()
+            for row in visitor_rows:
+                items.append(
+                    {
+                        "ma_luot_gui": row.get("ma_luot_gui") or "",
+                        "loai_khach": "vang_lai",
+                        "bien_so_xe": row.get("bien_so_xe") or "",
+                        "ma_loai_xe": row.get("ma_loai_xe") or "",
+                        "ma_khu_vuc": row.get("ma_khu_vuc") or "",
+                        "ma_vi_tri": row.get("ma_vi_tri") or "",
+                        "thoi_gian_vao": str(row.get("thoi_gian_vao") or ""),
+                        "ten_chu_xe": "Khách vãng lai",
+                        "ma_can_ho": "-",
+                        "ten_hang_dong_xe": "",
+                    }
+                )
+
+        filtered: List[Dict[str, Any]] = []
+        for it in items:
+            if zone_filter and str(it.get("ma_khu_vuc") or "").upper() != zone_filter:
+                continue
+            if type_filter and str(it.get("ma_loai_xe") or "").upper() != type_filter:
+                continue
+            if plate_filter and plate_filter not in str(it.get("bien_so_xe") or "").upper():
+                continue
+            filtered.append(it)
+
+        filtered.sort(key=lambda x: str(x.get("thoi_gian_vao") or ""), reverse=True)
+        return filtered
+
+    def handle_monitor_active_parkings(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.6.1: Xem danh sách xe đang gửi trong bãi (cư dân + khách vãng lai)."""
+        db = self._db()
+        items = self._collect_active_parking_items(
+            db,
+            ma_khu_vuc=str(payload.get("ma_khu_vuc") or ""),
+            bien_so_xe=str(payload.get("bien_so_xe") or ""),
+            loai_khach=str(payload.get("loai_khach") or ""),
+            ma_loai_xe=str(payload.get("ma_loai_xe") or ""),
+        )
+        res_cnt = sum(1 for x in items if x.get("loai_khach") == "cu_dan")
+        vis_cnt = sum(1 for x in items if x.get("loai_khach") == "vang_lai")
+        return {
+            "total": len(items),
+            "resident_count": res_cnt,
+            "visitor_count": vis_cnt,
+            "items": items,
+        }
+
+    def handle_monitor_available_slots(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.6.2: Xem các chỗ đỗ đang trống (hoặc đã phân chỗ nhưng hiện chưa có xe đỗ)."""
+        db = self._db()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip().upper()
+        include_allocated = bool(payload.get("include_allocated", False))
+        allowed_statuses = (
+            [SlotStatus.TRONG.value, SlotStatus.DA_PHAN_CHO.value]
+            if include_allocated
+            else [SlotStatus.TRONG.value]
+        )
+
+        placeholders = ", ".join(["%s"] * len(allowed_statuses))
+        conditions = [f"v.trang_thai_vi_tri IN ({placeholders})"]
+        params: List[Any] = list(allowed_statuses)
+        if ma_khu_vuc:
+            conditions.append("v.ma_khu_vuc = %s")
+            params.append(ma_khu_vuc)
+
+        where_sql = " AND ".join(conditions)
+        rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT v.ma_vi_tri,
+                   v.ma_khu_vuc,
+                   kv.ten_khu_vuc,
+                   kv.ma_loai_xe,
+                   v.ten_vi_tri,
+                   v.nhom_vi_tri,
+                   v.trang_thai_vi_tri,
+                   v.thoi_gian_cap_nhat
+            FROM vi_tri_do v
+            JOIN khu_vuc kv ON kv.ma_khu_vuc = v.ma_khu_vuc
+            WHERE {where_sql}
+            ORDER BY v.ma_khu_vuc ASC, v.ma_vi_tri ASC
+            """,
+            tuple(params),
+        )
+        return {
+            "total": len(rows),
+            "items": rows,
+        }
+
+    def handle_monitor_occupied_slots(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.6.3: Xem các vị trí đang có xe kèm biển số & thông tin xe đang đỗ."""
+        overview = self.handle_monitor_overview_map(_session, payload)
+        bien_so_filter = str(payload.get("bien_so_xe") or "").strip().upper()
+        occupied = [
+            s
+            for s in overview.get("slots", [])
+            if s.get("trang_thai_vi_tri") == SlotStatus.DANG_CO_XE.value
+            and (
+                not bien_so_filter
+                or bien_so_filter in str(s.get("bien_so_xe") or "").upper()
+            )
+        ]
+        return {
+            "total": len(occupied),
+            "items": occupied,
+        }
+
+    def handle_monitor_overview_map(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.6.4 & 2.6.1 / 2.6.2: Trả về tổng quan khu vực và toàn bộ ô đỗ để render 2D/3D."""
+        db = self._db()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip().upper()
+        status_filter = str(payload.get("trang_thai_vi_tri") or "").strip()
+
+        zones = _safe_fetch_all(
+            db,
+            """
+            SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe, tong_so_cho,
+                   so_xe_dang_gui, trang_thai_khu_vuc, ly_do_ngung
+            FROM khu_vuc
+            ORDER BY ma_khu_vuc ASC
+            """,
+        )
+
+        slot_conditions = ["1=1"]
+        slot_params: List[Any] = []
+        if ma_khu_vuc:
+            slot_conditions.append("v.ma_khu_vuc = %s")
+            slot_params.append(ma_khu_vuc)
+        if status_filter:
+            slot_conditions.append("v.trang_thai_vi_tri = %s")
+            slot_params.append(status_filter)
+
+        raw_slots = _safe_fetch_all(
+            db,
+            f"""
+            SELECT v.ma_vi_tri,
+                   v.ma_khu_vuc,
+                   kv.ten_khu_vuc,
+                   kv.ma_loai_xe,
+                   v.ten_vi_tri,
+                   v.nhom_vi_tri,
+                   v.trang_thai_vi_tri,
+                   v.ly_do_ngung,
+                   v.thoi_gian_cap_nhat
+            FROM vi_tri_do v
+            JOIN khu_vuc kv ON kv.ma_khu_vuc = v.ma_khu_vuc
+            WHERE {" AND ".join(slot_conditions)}
+            ORDER BY v.ma_khu_vuc ASC, v.ma_vi_tri ASC
+            """,
+            tuple(slot_params),
+        )
+
+        # Map biển số đang đỗ hoặc đã phân chỗ vào từng vị trí
+        active_items = self._collect_active_parking_items(db)
+        active_by_slot: Dict[str, Dict[str, Any]] = {}
+        for item in active_items:
+            slot_code = str(item.get("ma_vi_tri") or "").strip()
+            if slot_code:
+                active_by_slot[slot_code] = item
+
+        alloc_rows = _safe_fetch_all(
+            db,
+            """
+            SELECT pb.ma_vi_tri,
+                   pb.ma_can_ho,
+                   pb.loai_cho_cap,
+                   pt.bien_so_xe,
+                   cd.ho_ten AS ten_chu_xe
+            FROM phan_bo_cho_do pb
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_vi_tri_co_dinh = pb.ma_vi_tri
+            LEFT JOIN phuong_tien pt ON pt.ma_phuong_tien = ql.ma_phuong_tien
+            LEFT JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+            WHERE pb.trang_thai_su_dung = 'dang_hieu_luc'
+            """,
+        )
+        alloc_by_slot: Dict[str, Dict[str, Any]] = {
+            str(r.get("ma_vi_tri")): r for r in alloc_rows if r.get("ma_vi_tri")
+        }
+
+        enriched_slots: List[Dict[str, Any]] = []
+        counts = {
+            SlotStatus.TRONG.value: 0,
+            SlotStatus.DA_PHAN_CHO.value: 0,
+            SlotStatus.DANG_CO_XE.value: 0,
+            SlotStatus.NGUNG_SU_DUNG.value: 0,
+        }
+        for s in raw_slots:
+            code = str(s.get("ma_vi_tri") or "")
+            st = str(s.get("trang_thai_vi_tri") or SlotStatus.TRONG.value)
+            if st in counts:
+                counts[st] += 1
+
+            active = active_by_slot.get(code)
+            alloc = alloc_by_slot.get(code)
+            bien_so = (active or {}).get("bien_so_xe") or (alloc or {}).get("bien_so_xe") or ""
+            ten_chu = (active or {}).get("ten_chu_xe") or (alloc or {}).get("ten_chu_xe") or ""
+            ma_can_ho = (active or {}).get("ma_can_ho") or (alloc or {}).get("ma_can_ho") or ""
+
+            enriched_slots.append(
+                {
+                    **s,
+                    "bien_so_xe": bien_so,
+                    "loai_khach": (active or {}).get("loai_khach") or ("cu_dan" if alloc else ""),
+                    "ten_chu_xe": ten_chu,
+                    "ma_can_ho": ma_can_ho,
+                    "thoi_gian_vao": (active or {}).get("thoi_gian_vao") or "",
+                }
+            )
+
+        cap_summary = self._collect_parking_capacity(db)
+        return {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "zones": zones,
+            "slots": enriched_slots,
+            "active_parkings": active_items,
+            "summary": {
+                "tong_suc_chua": cap_summary.get("tong_suc_chua", 0),
+                "tong_xe_dang_gui": cap_summary.get("tong_xe_dang_gui", 0),
+                "xe_cu_dan_dang_gui": cap_summary.get("xe_cu_dan_dang_gui", 0),
+                "xe_vang_lai_dang_gui": cap_summary.get("xe_vang_lai_dang_gui", 0),
+                "cho_con_trong": cap_summary.get("cho_con_trong", 0),
+                **counts,
+            },
+        }
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -592,6 +885,34 @@ def register_monitor_admin_routes(
         Actions.ADMIN_QUERY_LOGS,
         handler.handle_admin_query_logs,
         allowed_roles=[Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.MONITOR_ACTIVE_PARKINGS,
+        handler.handle_monitor_active_parkings,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.MONITOR_AVAILABLE_SLOTS,
+        handler.handle_monitor_available_slots,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.MONITOR_OCCUPIED_SLOTS,
+        handler.handle_monitor_occupied_slots,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.MONITOR_OVERVIEW_MAP,
+        handler.handle_monitor_overview_map,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
         is_mutation=False,
         require_auth=True,
     )
