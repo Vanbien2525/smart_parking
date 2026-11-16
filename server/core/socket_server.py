@@ -120,13 +120,18 @@ class SocketServer:
         )
         self.bound_port: int = int(self._tcp_server.server_address[1])
         self._thread: Optional[threading.Thread] = None
+        self._serve_thread_id: Optional[int] = None
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
-    def serve_forever(self) -> None:
+    def serve_forever(self, poll_interval: float = 0.2) -> None:
         """Chạy TCP Server đồng bộ và khởi động reaper quét phiên timeout."""
         self.session_manager.start_reaper()
+        self._serve_thread_id = threading.get_ident()
         try:
-            self._tcp_server.serve_forever(poll_interval=0.5)
+            self._tcp_server.serve_forever(poll_interval=poll_interval)
         finally:
+            self._serve_thread_id = None
             self.session_manager.stop_reaper()
 
     def start_in_thread(self) -> threading.Thread:
@@ -135,7 +140,7 @@ class SocketServer:
             return self._thread
         self.session_manager.start_reaper()
         self._thread = threading.Thread(
-            target=self._tcp_server.serve_forever,
+            target=self.serve_forever,
             kwargs={"poll_interval": 0.2},
             name="ParkingTCPServerThread",
             daemon=True,
@@ -144,10 +149,33 @@ class SocketServer:
         return self._thread
 
     def stop(self) -> None:
-        """Dừng TCP Server và giải phóng toàn bộ kết nối đang mở."""
+        """Dừng TCP Server an toàn (tránh deadlock nếu gọi trên chính luồng serve)."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
         self._tcp_server.is_stopping = True
-        self._tcp_server.shutdown()
-        self._tcp_server.server_close()
         self.session_manager.stop_reaper()
-        if self._thread is not None and self._thread.is_alive():
+
+        current_tid = threading.get_ident()
+        if self._serve_thread_id is not None and self._serve_thread_id != current_tid:
+            try:
+                self._tcp_server.shutdown()
+            except Exception:
+                pass
+        elif self._serve_thread_id == current_tid:
+            # Tránh deadlock nếu stop() bị gọi chen ngang trên chính luồng đang chạy serve_forever
+            setattr(self._tcp_server, "_BaseServer__shutdown_request", True)
+
+        try:
+            self._tcp_server.server_close()
+        except OSError:
+            pass
+
+        if (
+            self._thread is not None
+            and self._thread is not threading.current_thread()
+            and self._thread.is_alive()
+        ):
             self._thread.join(timeout=2.0)

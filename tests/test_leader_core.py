@@ -437,6 +437,29 @@ class TestLeaderCore(unittest.TestCase):
         self.assertFalse(btn_edit.isEnabled())
         self.assertTrue(btn_view.isEnabled())
 
+    def test_09_socket_server_graceful_stop_no_deadlock(self) -> None:
+        """Kiểm tra dừng SocketServer an toàn, nhanh chóng và idempotent (fix Ctrl+C)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = FileLogger(Path(tmp) / "logs")
+            sess_mgr = SessionManager(file_logger=logger)
+            srv = SocketServer(
+                host="127.0.0.1",
+                port=0,
+                router=Router(file_logger=logger),
+                session_manager=sess_mgr,
+                file_logger=logger,
+            )
+            thread = srv.start_in_thread()
+            client = SocketClient(host="127.0.0.1", port=srv.bound_port)
+            self.assertTrue(client.connect_to_server(timeout=2.0))
+            t0 = time.monotonic()
+            srv.stop()
+            srv.stop()  # gọi lại lần 2 phải idempotent
+            elapsed = time.monotonic() - t0
+            client.disconnect()
+            self.assertLess(elapsed, 2.0)
+            self.assertFalse(thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
