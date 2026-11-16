@@ -2,7 +2,7 @@
 
 from typing import Dict, Optional
 
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QTabWidget, QVBoxLayout, QWidget
 
 from client.network.socket_client import SocketClient
 from client.ui.manager.dashboard_view import DashboardView
@@ -15,6 +15,7 @@ from client.ui.manager.stats_history_view import (
     ManagerNotifyView,
     ManagerStatsView,
 )
+from client.ui.manager.vehicle_approval_view import VehicleApprovalView
 from client.ui.theme.components import EmptyStateWidget
 from client.ui.theme.role_shell import RolePortalWindow
 
@@ -60,9 +61,23 @@ class ManagerWindow(RolePortalWindow):
         self.hr_view = custom_views.get("1.3_staff_resident") or HRView(
             socket_client=socket_client, read_only=False
         )
-        self.infra_view = custom_views.get("1.4_slots") or InfraPricingView(
+        self.vehicle_approval_view = VehicleApprovalView(
+            socket_client=socket_client, read_only=False
+        )
+        self.infra_view = InfraPricingView(
             socket_client=socket_client, read_only=False, initial_tab=0
         )
+        if "1.4_slots" not in custom_views:
+            slots_tabs = QTabWidget()
+            slots_tabs.addTab(
+                self.vehicle_approval_view,
+                "1.4.1–4, 1.4.15–19 Duyệt xe & Mua thêm chỗ",
+            )
+            slots_tabs.addTab(
+                self.infra_view,
+                "1.4.5–14 Khu vực & Ô đỗ",
+            )
+            custom_views["1.4_slots"] = slots_tabs
         self.pricing_view = custom_views.get("1.5_pricing") or InfraPricingView(
             socket_client=socket_client, read_only=False, initial_tab=2
         )
@@ -82,7 +97,6 @@ class ManagerWindow(RolePortalWindow):
             socket_client=socket_client, read_only=False
         )
         custom_views.setdefault("1.3_staff_resident", self.hr_view)
-        custom_views.setdefault("1.4_slots", self.infra_view)
         custom_views.setdefault("1.5_pricing", self.pricing_view)
         custom_views.setdefault("1.6_monitor", self.monitor_view)
         custom_views.setdefault("1.7_billing", self.finance_view)
@@ -122,6 +136,7 @@ class ManagerWindow(RolePortalWindow):
         self.dashboard_view.refresh_data()
         for view in (
             self.hr_view,
+            self.vehicle_approval_view,
             self.infra_view,
             self.pricing_view,
             self.monitor_view,

@@ -42,8 +42,12 @@ from client.ui.manager.stats_history_view import (
     ManagerNotifyView,
     ManagerStatsView,
 )
+from client.ui.manager.vehicle_approval_view import VehicleApprovalView
 from client.ui.resident.bills_payment_view import BillsPaymentView
+from client.ui.resident.extra_slot_view import ExtraSlotView
 from client.ui.resident.resident_notify_view import ResidentNotifyView
+from client.ui.resident.vehicle_lookup_view import VehicleLookupView
+from client.ui.resident.vehicle_view import ResidentVehicleView
 from client.ui.staff.staff_monitor_notify_view import (
     StaffMonitorView,
     StaffNotifyInboxView,
@@ -352,6 +356,19 @@ class MainWindow(QMainWindow):
             park_tabs.addTab(ManagerHistoryView(socket_client=self.socket_client, read_only=True), "4.8.3 Lịch sử xe vào/ra")
             parking_ro = park_tabs
 
+        slots_manager_widget = ex.get("1.4_slots")
+        if slots_manager_widget is None:
+            slots_tabs = QTabWidget()
+            slots_tabs.addTab(
+                VehicleApprovalView(socket_client=self.socket_client, read_only=False),
+                "1.4.1–4, 1.4.15–19 Duyệt xe & Mua thêm chỗ",
+            )
+            slots_tabs.addTab(
+                InfraPricingView(socket_client=self.socket_client, read_only=False, initial_tab=0),
+                "1.4.5–14 Khu vực & Ô đỗ",
+            )
+            slots_manager_widget = slots_tabs
+
         specs = [
             ("1.1_dashboard", "1.1 Dashboard tổng quan", "Dashboard Quản lý chung cư (1.1)",
              "Tổng quan yêu cầu chờ duyệt, sức chứa, doanh thu và cảnh báo",
@@ -366,8 +383,8 @@ class MainWindow(QMainWindow):
              ex.get("1.3_staff_resident") or HRView(socket_client=self.socket_client, read_only=False),
              "NGHIỆP VỤ QUẢN LÝ"),
             ("1.4_slots", "1.4 Duyệt xe & Vị trí", "Duyệt xe, Khu vực & Vị trí đỗ (1.4)",
-             "Quản lý khu vực, ô đỗ và phân bổ chỗ đỗ xe chung cư",
-             ex.get("1.4_slots") or InfraPricingView(socket_client=self.socket_client, read_only=False, initial_tab=0),
+             "Duyệt đăng ký xe, mua thêm chỗ, thu hồi chỗ và quản lý khu vực/ô đỗ",
+             slots_manager_widget,
              "NGHIỆP VỤ QUẢN LÝ"),
             ("1.5_pricing", "1.5 Bảng giá gửi xe", "Cấu hình Bảng giá gửi xe (1.5)",
              "Thiết lập đơn giá tháng và vãng lai cho Ô tô / Xe máy",
@@ -462,15 +479,15 @@ class MainWindow(QMainWindow):
              "CĂN HỘ & TÀI KHOẢN"),
             ("3.2_my_vehicles", "3.2 Xe của tôi", "Đăng ký & Quản lý Phương tiện (3.2)",
              "Đăng ký xe mới kèm ảnh cà-vẹt và theo dõi duyệt",
-             ex.get("3.2_my_vehicles") or self._build_placeholder("3.2 Xe của tôi", "Đăng ký xe mới và quản lý danh sách xe căn hộ", "Thành viên 4 (Long)"),
+             ex.get("3.2_my_vehicles") or ResidentVehicleView(socket_client=self.socket_client),
              "PHƯƠNG TIỆN & CHỖ ĐỖ"),
             ("3.3_buy_slots", "3.3 Mua thêm chỗ ô tô", "Yêu cầu Mua thêm Chỗ đỗ Ô tô (3.3)",
              "Gửi yêu cầu mua thêm chỗ đỗ và theo dõi chỗ được cấp",
-             ex.get("3.3_buy_slots") or self._build_placeholder("3.3 Mua thêm chỗ ô tô", "Đăng ký thêm chỗ đỗ ô tô cho căn hộ", "Thành viên 4 (Long)"),
+             ex.get("3.3_buy_slots") or ExtraSlotView(socket_client=self.socket_client),
              "PHƯƠNG TIỆN & CHỖ ĐỖ"),
             ("3.4_track_vehicle", "3.4 Tra cứu & Định vị xe", "Tra cứu & Định vị Xe đang gửi (3.4)",
-             "Xem xe đang ở trong bãi, vị trí đỗ và lịch sử gửi",
-             ex.get("3.4_track_vehicle") or self._build_placeholder("3.4 Tra cứu & Định vị xe", "Định vị vị trí xe đang đỗ của căn hộ", "Thành viên 4 (Long)"),
+             "Xem xe đang ở trong bãi, vị trí đỗ 2D/3D và lịch sử gửi",
+             ex.get("3.4_track_vehicle") or VehicleLookupView(socket_client=self.socket_client),
              "PHƯƠNG TIỆN & CHỖ ĐỖ"),
             ("3.5_bills", "3.5 Hóa đơn & Thanh toán", "Hóa đơn Tháng & Thanh toán QR (3.5)",
              "Xem hóa đơn hàng tháng, thanh toán QR hoặc xem biên nhận",
@@ -491,6 +508,7 @@ class MainWindow(QMainWindow):
         if infra_ro is None:
             tabs = QTabWidget()
             tabs.addTab(HRView(socket_client=self.socket_client, read_only=True), "4.6.1 Nhân sự & Cư dân")
+            tabs.addTab(VehicleApprovalView(socket_client=self.socket_client, read_only=True), "4.6.2 Phương tiện & Chỗ đỗ")
             tabs.addTab(InfraPricingView(socket_client=self.socket_client, read_only=True), "4.6.3–4.6.4 Khu vực, Vị trí & Giá")
             infra_ro = tabs
 
@@ -637,7 +655,7 @@ class MainWindow(QMainWindow):
 
         elif event == PushEvents.PARKING_STATE_CHANGED:
             self.parking_state_pushed.emit(data)
-            for key in ("1.1_dashboard", "1.6_monitor", "2.6_monitor", "4.5_dashboard_ro", "4.8_parking_ro"):
+            for key in ("1.1_dashboard", "1.6_monitor", "2.6_monitor", "3.4_track_vehicle", "4.5_dashboard_ro", "4.8_parking_ro"):
                 page = self._pages.get(key)
                 if page is not None and hasattr(page, "refresh_data"):
                     try:

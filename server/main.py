@@ -109,6 +109,17 @@ def _register_available_handlers(ctx: ServerContext) -> None:
     except ImportError:
         pass
 
+    try:
+        from server.handlers.vehicle_handler import register_vehicle_routes
+
+        register_vehicle_routes(
+            ctx.router,
+            file_logger=ctx.file_logger,
+            cavet_dir=ctx.config.cavet_dir,
+        )
+    except ImportError:
+        pass
+
 
 def create_socket_server(
     config: Optional[ServerConfig] = None,
