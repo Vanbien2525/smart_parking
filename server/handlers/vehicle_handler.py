@@ -1867,6 +1867,129 @@ class VehicleHandler:
             "ma_vi_tri": ma_vi_tri,
         }
 
+    # ==========================================================================
+    # 3.4.1 – 3.4.4: CƯ DÂN TRA CỨU & ĐỊNH VỊ XE TRÊN BÃI + 10 LƯỢT VÀO/RA
+    # ==========================================================================
+    def handle_resident_lookup(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.4.1 – 3.4.4: Tra cứu trạng thái trong/ngoài bãi, vị trí đỗ, 10 lượt vào/ra & Mini-Map."""
+        keyword = str(payload.get("keyword") or "").strip().lower()
+        db = self._db()
+        ma_cu_dan, ma_can_ho, apartment = self._resolve_resident_context(db, session)
+
+        vehicles = db.fetch_all(
+            """
+            SELECT pt.ma_phuong_tien,
+                   pt.ma_cu_dan,
+                   pt.ma_loai_xe,
+                   lpt.ten_loai_xe,
+                   pt.bien_so_xe,
+                   pt.ten_hang_dong_xe,
+                   pt.mau_xe,
+                   pt.duong_dan_cavet,
+                   pt.trang_thai_xe,
+                   ql.ma_vi_tri_co_dinh,
+                   vt.ten_vi_tri,
+                   vt.trang_thai_vi_tri,
+                   ql.ma_khu_vuc_phan_cong,
+                   kv.ten_khu_vuc,
+                   kv.tong_so_cho,
+                   kv.so_xe_dang_gui,
+                   ql.dang_trong_bai,
+                   ql.thoi_gian_vao,
+                   ql.thoi_gian_ra,
+                   pb.loai_cho_cap
+            FROM phuong_tien pt
+            JOIN loai_phuong_tien lpt ON lpt.ma_loai_xe = pt.ma_loai_xe
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_phuong_tien = pt.ma_phuong_tien
+            LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = ql.ma_vi_tri_co_dinh
+            LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = COALESCE(vt.ma_khu_vuc, ql.ma_khu_vuc_phan_cong)
+            LEFT JOIN phan_bo_cho_do pb
+                   ON pb.ma_vi_tri = ql.ma_vi_tri_co_dinh
+                  AND pb.ma_can_ho = %s
+                  AND pb.trang_thai_su_dung = %s
+            WHERE pt.ma_cu_dan = %s
+            ORDER BY
+                CASE pt.trang_thai_xe
+                    WHEN 'dang_hoat_dong' THEN 0
+                    WHEN 'cho_duyet' THEN 1
+                    ELSE 2
+                END,
+                pt.ma_phuong_tien DESC
+            """,
+            (ma_can_ho, SlotAllocationStatus.DANG_HIEU_LUC.value, ma_cu_dan),
+        )
+
+        if keyword:
+            vehicles = [
+                v for v in vehicles
+                if keyword in str(v.get("bien_so_xe") or "").lower()
+                or keyword in str(v.get("ten_hang_dong_xe") or "").lower()
+                or keyword in str(v.get("ma_vi_tri_co_dinh") or "").lower()
+            ]
+
+        zone_ids: set[str] = set()
+        for v in vehicles:
+            plate = str(v.get("bien_so_xe") or "").strip()
+            history_rows = (
+                self.file_logger.query_logs(
+                    "parking_history",
+                    filters={"bien_so_xe": plate},
+                    limit=10,
+                )
+                if plate
+                else []
+            )
+            # Đảm bảo khớp chính xác biển số (query_logs dùng substring match cho bien_so_xe)
+            v["recent_history"] = [
+                h for h in history_rows
+                if str(h.get("bien_so_xe") or "").strip().upper() == plate.upper()
+            ][:10]
+            if v.get("ma_khu_vuc_phan_cong"):
+                zone_ids.add(str(v["ma_khu_vuc_phan_cong"]))
+
+        zone_maps: Dict[str, List[Dict[str, Any]]] = {}
+        zone_info: Dict[str, Dict[str, Any]] = {}
+        for zid in sorted(zone_ids):
+            zrow = db.fetch_one(
+                """
+                SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe,
+                       tong_so_cho, so_xe_dang_gui, trang_thai_khu_vuc
+                FROM khu_vuc
+                WHERE ma_khu_vuc = %s
+                """,
+                (zid,),
+            )
+            if zrow:
+                zone_info[zid] = zrow
+            slot_rows = db.fetch_all(
+                """
+                SELECT vt.ma_vi_tri, vt.ma_khu_vuc, vt.ten_vi_tri,
+                       vt.nhom_vi_tri, vt.trang_thai_vi_tri,
+                       pt.bien_so_xe, pb.ma_can_ho
+                FROM vi_tri_do vt
+                LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_vi_tri_co_dinh = vt.ma_vi_tri
+                LEFT JOIN phuong_tien pt ON pt.ma_phuong_tien = ql.ma_phuong_tien
+                LEFT JOIN phan_bo_cho_do pb
+                       ON pb.ma_vi_tri = vt.ma_vi_tri
+                      AND pb.trang_thai_su_dung = %s
+                WHERE vt.ma_khu_vuc = %s
+                ORDER BY vt.ma_vi_tri ASC
+                """,
+                (SlotAllocationStatus.DANG_HIEU_LUC.value, zid),
+            )
+            zone_maps[zid] = slot_rows
+
+        return {
+            "ma_cu_dan": ma_cu_dan,
+            "ma_can_ho": ma_can_ho,
+            "apartment": apartment,
+            "vehicles": vehicles,
+            "zone_maps": zone_maps,
+            "zone_info": zone_info,
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1957,5 +2080,11 @@ def register_vehicle_routes(
         handler.handle_revoke_allocation,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
+    )
+    router.register(
+        Actions.VEHICLE_RESIDENT_LOOKUP,
+        handler.handle_resident_lookup,
+        allowed_roles=[Roles.CU_DAN.value],
+        is_mutation=False,
     )
     return handler
