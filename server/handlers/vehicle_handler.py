@@ -22,9 +22,11 @@ from shared.constants import (
     Roles,
     SlotAllocationStatus,
     SlotAllocationTypes,
+    SlotStatus,
     VehicleRequestTypes,
     VehicleStatus,
     VehicleTypes,
+    ZoneStatus,
 )
 from shared.protocol import Actions
 from shared.validators import save_base64_image, validate_license_plate
@@ -679,6 +681,211 @@ class VehicleHandler:
             "image_base64": base64.b64encode(raw_bytes).decode("ascii"),
         }
 
+    # ==========================================================================
+    # 1.4.1 & 1.4.4: QUẢN LÝ XEM DANH SÁCH YÊU CẦU PHƯƠNG TIỆN & LỊCH SỬ DUYỆT
+    # ==========================================================================
+    def handle_manager_list_requests(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.1 & 1.4.4: Lọc danh sách yêu cầu phương tiện chờ duyệt hoặc lịch sử duyệt."""
+        trang_thai = str(payload.get("trang_thai_duyet") or "").strip()
+        loai_yeu_cau = str(payload.get("loai_yeu_cau") or "").strip()
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip().upper()
+        keyword = str(payload.get("keyword") or payload.get("search_query") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if trang_thai and trang_thai != "all":
+            conditions.append("yc.trang_thai_duyet = %s")
+            params.append(trang_thai)
+        if loai_yeu_cau and loai_yeu_cau != "all":
+            conditions.append("yc.loai_yeu_cau = %s")
+            params.append(loai_yeu_cau)
+        if ma_loai_xe and ma_loai_xe != "ALL":
+            conditions.append("pt.ma_loai_xe = %s")
+            params.append(ma_loai_xe)
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(pt.bien_so_xe ILIKE %s OR cd.ho_ten ILIKE %s OR cd.ma_can_ho ILIKE %s OR pt.ten_hang_dong_xe ILIKE %s)"
+            )
+            params.extend([like, like, like, like])
+
+        where_sql = " AND ".join(conditions)
+        db = self._db()
+        rows = db.fetch_all(
+            f"""
+            SELECT yc.ma_yeu_cau_xe,
+                   yc.ma_cu_dan,
+                   yc.ma_phuong_tien,
+                   yc.loai_yeu_cau,
+                   yc.vi_tri_mong_muon,
+                   yc.noi_dung_thay_doi,
+                   yc.trang_thai_duyet,
+                   yc.ma_nhan_vien_duyet,
+                   nv.ho_ten AS ten_quan_ly_duyet,
+                   yc.ly_do_phan_hoi,
+                   yc.ngay_gui_yeu_cau,
+                   cd.ho_ten AS ten_cu_dan,
+                   cd.so_dien_thoai,
+                   cd.ma_can_ho,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   ch.so_cho_oto_mac_dinh,
+                   ch.so_cho_oto_mua_them,
+                   pt.ma_loai_xe,
+                   lpt.ten_loai_xe,
+                   pt.bien_so_xe,
+                   pt.ten_hang_dong_xe,
+                   pt.mau_xe,
+                   pt.duong_dan_cavet,
+                   pt.trang_thai_xe,
+                   ql.ma_vi_tri_co_dinh,
+                   ql.ma_khu_vuc_phan_cong,
+                   ql.dang_trong_bai
+            FROM yeu_cau_dang_ky_xe yc
+            JOIN cu_dan cd ON cd.ma_cu_dan = yc.ma_cu_dan
+            JOIN can_ho ch ON ch.ma_can_ho = cd.ma_can_ho
+            JOIN phuong_tien pt ON pt.ma_phuong_tien = yc.ma_phuong_tien
+            JOIN loai_phuong_tien lpt ON lpt.ma_loai_xe = pt.ma_loai_xe
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_phuong_tien = pt.ma_phuong_tien
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = yc.ma_nhan_vien_duyet
+            WHERE {where_sql}
+            ORDER BY
+                CASE yc.trang_thai_duyet WHEN 'cho_duyet' THEN 0 ELSE 1 END,
+                yc.ngay_gui_yeu_cau DESC,
+                yc.ma_yeu_cau_xe DESC
+            """,
+            tuple(params),
+        )
+
+        # Bổ sung thống kê hạn mức hiện tại cho từng căn hộ xuất hiện trong danh sách
+        quota_cache: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            apt_id = str(row["ma_can_ho"])
+            if apt_id not in quota_cache:
+                quota_cache[apt_id] = self._get_apartment_quota_stats(
+                    db,
+                    apt_id,
+                    {
+                        "ma_can_ho": apt_id,
+                        "toa_nha": row.get("toa_nha"),
+                        "so_tang": row.get("so_tang"),
+                        "so_cho_oto_mac_dinh": row.get("so_cho_oto_mac_dinh"),
+                        "so_cho_oto_mua_them": row.get("so_cho_oto_mua_them"),
+                    },
+                )
+            q = quota_cache[apt_id]
+            row["so_oto_dang_hoat_dong"] = q["so_oto_dang_hoat_dong"]
+            row["tong_suat_oto"] = q["tong_suat_oto"]
+            row["so_suat_oto_con_lai"] = q["so_suat_oto_con_lai"]
+            row["unassigned_allocations"] = q["unassigned_allocations"]
+
+        return {"total": len(rows), "items": rows}
+
+    def handle_get_assignable(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Lấy sơ đồ ô đỗ ô tô hoặc khu vực xe máy khả dụng phục vụ `SlotPickerDialog`."""
+        ma_loai_xe = str(payload.get("ma_loai_xe") or VehicleTypes.O_TO.value).strip().upper()
+        ma_can_ho = str(payload.get("ma_can_ho") or "").strip()
+        db = self._db()
+
+        if ma_loai_xe == VehicleTypes.XE_MAY.value:
+            zones = db.fetch_all(
+                """
+                SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe,
+                       tong_so_cho, so_xe_dang_gui,
+                       GREATEST(0, tong_so_cho - so_xe_dang_gui) AS so_cho_trong,
+                       trang_thai_khu_vuc
+                FROM khu_vuc
+                WHERE ma_loai_xe = %s AND trang_thai_khu_vuc = %s
+                ORDER BY ma_khu_vuc ASC
+                """,
+                (VehicleTypes.XE_MAY.value, ZoneStatus.HOAT_DONG.value),
+            )
+            return {
+                "ma_loai_xe": ma_loai_xe,
+                "zones": zones,
+                "slots": [],
+                "preallocated_slots": [],
+            }
+
+        preallocated_codes: set[str] = set()
+        preallocated_rows: List[Dict[str, Any]] = []
+        if ma_can_ho:
+            preallocated_rows = db.fetch_all(
+                """
+                SELECT pb.ma_phan_bo, pb.ma_vi_tri, pb.loai_cho_cap,
+                       vt.ma_khu_vuc, vt.ten_vi_tri, kv.ten_khu_vuc
+                FROM phan_bo_cho_do pb
+                JOIN vi_tri_do vt ON vt.ma_vi_tri = pb.ma_vi_tri
+                JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+                LEFT JOIN quan_ly_phuong_tien_ra_vao ql
+                       ON ql.ma_vi_tri_co_dinh = pb.ma_vi_tri
+                WHERE pb.ma_can_ho = %s
+                  AND pb.trang_thai_su_dung = %s
+                  AND ql.ma_quan_ly_xe IS NULL
+                ORDER BY pb.ma_phan_bo ASC
+                """,
+                (ma_can_ho, SlotAllocationStatus.DANG_HIEU_LUC.value),
+            )
+            preallocated_codes = {str(r["ma_vi_tri"]) for r in preallocated_rows}
+
+        zones = db.fetch_all(
+            """
+            SELECT ma_khu_vuc, ten_khu_vuc, ma_loai_xe,
+                   tong_so_cho, so_xe_dang_gui, trang_thai_khu_vuc
+            FROM khu_vuc
+            WHERE ma_loai_xe = %s AND trang_thai_khu_vuc = %s
+            ORDER BY ma_khu_vuc ASC
+            """,
+            (VehicleTypes.O_TO.value, ZoneStatus.HOAT_DONG.value),
+        )
+        slots = db.fetch_all(
+            """
+            SELECT vt.ma_vi_tri,
+                   vt.ma_khu_vuc,
+                   kv.ten_khu_vuc,
+                   vt.ten_vi_tri,
+                   vt.nhom_vi_tri,
+                   vt.trang_thai_vi_tri,
+                   vt.ly_do_ngung,
+                   pb.ma_can_ho AS can_ho_dang_giu,
+                   pt.bien_so_xe
+            FROM vi_tri_do vt
+            JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+            LEFT JOIN phan_bo_cho_do pb
+                   ON pb.ma_vi_tri = vt.ma_vi_tri
+                  AND pb.trang_thai_su_dung = %s
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql
+                   ON ql.ma_vi_tri_co_dinh = vt.ma_vi_tri
+            LEFT JOIN phuong_tien pt
+                   ON pt.ma_phuong_tien = ql.ma_phuong_tien
+            WHERE kv.ma_loai_xe = %s AND kv.trang_thai_khu_vuc = %s
+            ORDER BY vt.ma_khu_vuc ASC, vt.ma_vi_tri ASC
+            """,
+            (
+                SlotAllocationStatus.DANG_HIEU_LUC.value,
+                VehicleTypes.O_TO.value,
+                ZoneStatus.HOAT_DONG.value,
+            ),
+        )
+        for s in slots:
+            code = str(s["ma_vi_tri"])
+            is_pre = code in preallocated_codes
+            is_free = s.get("trang_thai_vi_tri") == SlotStatus.TRONG.value
+            is_visitor_only = s.get("nhom_vi_tri") == "vi_tri_vang_lai"
+            s["is_apartment_preallocated"] = is_pre
+            s["assignable"] = bool(is_pre or (is_free and not is_visitor_only))
+
+        return {
+            "ma_loai_xe": ma_loai_xe,
+            "zones": zones,
+            "slots": slots,
+            "preallocated_slots": preallocated_rows,
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -708,6 +915,18 @@ def register_vehicle_routes(
         Actions.VEHICLE_GET_CAVET,
         handler.handle_get_cavet,
         allowed_roles=[Roles.CU_DAN.value, Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+    )
+    router.register(
+        Actions.VEHICLE_MANAGER_LIST_REQUESTS,
+        handler.handle_manager_list_requests,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+    )
+    router.register(
+        Actions.VEHICLE_GET_ASSIGNABLE,
+        handler.handle_get_assignable,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
     )
     return handler
