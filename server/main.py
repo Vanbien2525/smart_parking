@@ -1,7 +1,7 @@
 """Entrypoint khởi chạy Smart Parking TCP Socket Server."""
 
 import signal
-import sys
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -97,19 +97,25 @@ def main() -> int:
         ma_loi="SERVER_STARTED",
     )
 
+    stop_event = threading.Event()
+
     def _handle_sig(_signum: int, _frame: object) -> None:
-        print("\n[SmartParking Server] Đang dừng máy chủ an toàn...")
-        server.stop()
-        sys.exit(0)
+        stop_event.set()
 
     signal.signal(signal.SIGINT, _handle_sig)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _handle_sig)
 
+    server.start_in_thread()
     try:
-        server.serve_forever()
+        while not stop_event.is_set():
+            stop_event.wait(timeout=0.25)
     except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        print("\n[SmartParking Server] Đang dừng máy chủ an toàn...")
         server.stop()
+        print("[SmartParking Server] Đã dừng hoàn toàn.")
     return 0
 
 
