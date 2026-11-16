@@ -1468,6 +1468,125 @@ class VehicleHandler:
         )
         return {"request": req_row}
 
+    # ==========================================================================
+    # 1.4.15 & 1.4.18: QUẢN LÝ DANH SÁCH YÊU CẦU MUA THÊM & CĂN HỘ ĐÃ CẤP CHỖ
+    # ==========================================================================
+    def handle_manager_list_extra_slots(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.15 & 1.4.18: Lọc yêu cầu mua thêm chỗ và danh sách căn hộ đã được cấp chỗ đỗ."""
+        trang_thai = str(payload.get("trang_thai_duyet") or "").strip()
+        keyword = str(payload.get("keyword") or "").strip()
+        include_revoked = bool(payload.get("include_revoked", False))
+
+        req_conds = ["1=1"]
+        req_params: List[Any] = []
+        if trang_thai and trang_thai != "all":
+            req_conds.append("yc.trang_thai_duyet = %s")
+            req_params.append(trang_thai)
+        if keyword:
+            like = f"%{keyword}%"
+            req_conds.append("(yc.ma_can_ho ILIKE %s OR cd.ho_ten ILIKE %s OR yc.nhu_cau_vi_tri ILIKE %s)")
+            req_params.extend([like, like, like])
+
+        db = self._db()
+        requests = db.fetch_all(
+            f"""
+            SELECT yc.ma_yeu_cau_cho,
+                   yc.ma_cu_dan,
+                   yc.ma_can_ho,
+                   cd.ho_ten AS ten_cu_dan,
+                   cd.so_dien_thoai,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   ch.so_cho_oto_mac_dinh,
+                   ch.so_cho_oto_mua_them,
+                   yc.nhu_cau_vi_tri,
+                   yc.ly_do_mua_them,
+                   yc.trang_thai_duyet,
+                   yc.ma_vi_tri_duoc_duyet,
+                   vt.ten_vi_tri,
+                   kv.ten_khu_vuc,
+                   yc.ma_nhan_vien_duyet,
+                   nv.ho_ten AS ten_quan_ly_duyet,
+                   yc.ly_do_tu_choi,
+                   yc.ngay_gui_yeu_cau
+            FROM yeu_cau_mua_them_cho yc
+            JOIN cu_dan cd ON cd.ma_cu_dan = yc.ma_cu_dan
+            JOIN can_ho ch ON ch.ma_can_ho = yc.ma_can_ho
+            LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = yc.ma_vi_tri_duoc_duyet
+            LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = yc.ma_nhan_vien_duyet
+            WHERE {' AND '.join(req_conds)}
+            ORDER BY
+                CASE yc.trang_thai_duyet WHEN 'cho_duyet' THEN 0 ELSE 1 END,
+                yc.ngay_gui_yeu_cau DESC,
+                yc.ma_yeu_cau_cho DESC
+            """,
+            tuple(req_params),
+        )
+
+        alloc_conds = ["1=1"]
+        alloc_params: List[Any] = []
+        if not include_revoked:
+            alloc_conds.append("pb.trang_thai_su_dung = %s")
+            alloc_params.append(SlotAllocationStatus.DANG_HIEU_LUC.value)
+        if keyword:
+            like = f"%{keyword}%"
+            alloc_conds.append("(pb.ma_can_ho ILIKE %s OR pb.ma_vi_tri ILIKE %s OR COALESCE(pt.bien_so_xe, '') ILIKE %s)")
+            alloc_params.extend([like, like, like])
+
+        allocations = db.fetch_all(
+            f"""
+            SELECT pb.ma_phan_bo,
+                   pb.ma_can_ho,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   ch.so_cho_oto_mac_dinh,
+                   ch.so_cho_oto_mua_them,
+                   pb.ma_vi_tri,
+                   vt.ten_vi_tri,
+                   vt.ma_khu_vuc,
+                   kv.ten_khu_vuc,
+                   vt.trang_thai_vi_tri,
+                   pb.loai_cho_cap,
+                   pb.ngay_cap,
+                   pb.trang_thai_su_dung,
+                   pb.ly_do_thu_hoi,
+                   ql.ma_phuong_tien,
+                   ql.dang_trong_bai,
+                   pt.bien_so_xe,
+                   pt.ten_hang_dong_xe
+            FROM phan_bo_cho_do pb
+            JOIN can_ho ch ON ch.ma_can_ho = pb.ma_can_ho
+            JOIN vi_tri_do vt ON vt.ma_vi_tri = pb.ma_vi_tri
+            JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql
+                   ON ql.ma_vi_tri_co_dinh = pb.ma_vi_tri
+                  AND pb.trang_thai_su_dung = %s
+            LEFT JOIN phuong_tien pt
+                   ON pt.ma_phuong_tien = ql.ma_phuong_tien
+                  AND pt.trang_thai_xe = %s
+            WHERE {' AND '.join(alloc_conds)}
+            ORDER BY
+                CASE pb.trang_thai_su_dung WHEN 'dang_hieu_luc' THEN 0 ELSE 1 END,
+                CASE pb.loai_cho_cap WHEN 'cho_mua_them' THEN 0 ELSE 1 END,
+                pb.ma_phan_bo DESC
+            """,
+            (
+                SlotAllocationStatus.DANG_HIEU_LUC.value,
+                VehicleStatus.DANG_HOAT_DONG.value,
+                *alloc_params,
+            ),
+        )
+
+        return {
+            "total_requests": len(requests),
+            "requests": requests,
+            "total_allocations": len(allocations),
+            "allocations": allocations,
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1534,5 +1653,11 @@ def register_vehicle_routes(
         handler.handle_resident_submit_extra_slot,
         allowed_roles=[Roles.CU_DAN.value],
         is_mutation=True,
+    )
+    router.register(
+        Actions.SLOT_REQUEST_MANAGER_LIST,
+        handler.handle_manager_list_extra_slots,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
     )
     return handler
