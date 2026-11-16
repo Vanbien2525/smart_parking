@@ -824,6 +824,358 @@ class MonitorAdminHandler:
             },
         }
 
+    # ==========================================================================
+    # NHÓM 1.8: THỐNG KÊ LƯỢT XE, CƯ DÂN VS VÃNG LAI & DOANH THU (MINH)
+    # ==========================================================================
+    @staticmethod
+    def _in_date_range(day_str: str, start_date: str, end_date: str) -> bool:
+        d = (day_str or "")[:10]
+        if not d:
+            return False
+        if start_date and d < start_date[:10]:
+            return False
+        if end_date and d > end_date[:10]:
+            return False
+        return True
+
+    def _query_all_parking_history(
+        self,
+        start_date: str = "",
+        end_date: str = "",
+        ma_khu_vuc: str = "",
+    ) -> List[Dict[str, Any]]:
+        filters: Dict[str, Any] = {}
+        if ma_khu_vuc:
+            filters["ma_khu_vuc"] = ma_khu_vuc
+        return self.file_logger.query_logs(
+            "parking_history",
+            start_date=start_date or None,
+            end_date=end_date or None,
+            filters=filters,
+            limit=0,
+        )
+
+    def handle_stats_vehicle_turns(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.8.1: Thống kê lượt xe vào/ra theo ngày và khu vực."""
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip().upper()
+
+        history_rows = self._query_all_parking_history(start_date, end_date, ma_khu_vuc)
+        by_day: Dict[str, Dict[str, Any]] = {}
+
+        for rec in history_rows:
+            in_day = str(rec.get("thoi_gian_vao") or rec.get("timestamp") or "")[:10]
+            if in_day and self._in_date_range(in_day, start_date, end_date):
+                bucket = by_day.setdefault(
+                    in_day, {"ngay": in_day, "luot_vao": 0, "luot_ra": 0, "bao_cao_ca": 0}
+                )
+                bucket["luot_vao"] += 1
+
+            out_raw = rec.get("thoi_gian_ra")
+            if out_raw or rec.get("trang_thai") == "da_ra_bai":
+                out_day = str(out_raw or rec.get("timestamp") or "")[:10]
+                if out_day and self._in_date_range(out_day, start_date, end_date):
+                    bucket = by_day.setdefault(
+                        out_day, {"ngay": out_day, "luot_vao": 0, "luot_ra": 0, "bao_cao_ca": 0}
+                    )
+                    bucket["luot_ra"] += 1
+
+        db = self._db()
+        conds = ["1=1"]
+        params: List[Any] = []
+        if start_date:
+            conds.append("ngay_ghi_nhan >= %s")
+            params.append(start_date[:10])
+        if end_date:
+            conds.append("ngay_ghi_nhan <= %s")
+            params.append(end_date[:10])
+        if ma_khu_vuc:
+            conds.append("ma_khu_vuc = %s")
+            params.append(ma_khu_vuc)
+
+        report_rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT ngay_ghi_nhan,
+                   COALESCE(SUM(so_luot_oto_vang_lai + so_luot_xemay_vang_lai + so_luot_xe_cu_dan), 0) AS tong_luot
+            FROM bao_cao_luot_va_thu_phi
+            WHERE {" AND ".join(conds)}
+            GROUP BY ngay_ghi_nhan
+            ORDER BY ngay_ghi_nhan ASC
+            """,
+            tuple(params),
+        )
+        for rr in report_rows:
+            d = str(rr.get("ngay_ghi_nhan") or "")[:10]
+            if not d:
+                continue
+            rep_turns = int(rr.get("tong_luot") or 0)
+            bucket = by_day.setdefault(
+                d, {"ngay": d, "luot_vao": 0, "luot_ra": 0, "bao_cao_ca": 0}
+            )
+            bucket["bao_cao_ca"] += rep_turns
+            if bucket["luot_vao"] == 0 and bucket["luot_ra"] == 0 and rep_turns > 0:
+                bucket["luot_vao"] = rep_turns
+                bucket["luot_ra"] = rep_turns
+
+        series = [by_day[k] for k in sorted(by_day.keys())]
+        tong_vao = sum(int(x["luot_vao"]) for x in series)
+        tong_ra = sum(int(x["luot_ra"]) for x in series)
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "ma_khu_vuc": ma_khu_vuc,
+            "tong_luot_vao": tong_vao,
+            "tong_luot_ra": tong_ra,
+            "tong_luot": tong_vao + tong_ra,
+            "series": series,
+        }
+
+    def handle_stats_resident_vs_visitor(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.8.2: Thống kê so sánh lượt xe Cư dân vs Khách vãng lai theo loại xe và ngày."""
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip().upper()
+        ma_loai_xe = str(payload.get("ma_loai_xe") or "").strip().upper()
+
+        history_rows = self._query_all_parking_history(start_date, end_date, ma_khu_vuc)
+        by_day: Dict[str, Dict[str, int]] = {}
+
+        for rec in history_rows:
+            v_type = str(rec.get("ma_loai_xe") or "").upper()
+            if ma_loai_xe and v_type != ma_loai_xe:
+                continue
+            day = str(rec.get("thoi_gian_vao") or rec.get("timestamp") or "")[:10]
+            if not day or not self._in_date_range(day, start_date, end_date):
+                continue
+            b = by_day.setdefault(
+                day,
+                {
+                    "ngay": day,
+                    "cu_dan_oto": 0,
+                    "cu_dan_xemay": 0,
+                    "cu_dan_tong": 0,
+                    "vang_lai_oto": 0,
+                    "vang_lai_xemay": 0,
+                    "vang_lai_tong": 0,
+                },
+            )
+            guest = str(rec.get("loai_khach") or "").lower()
+            if guest == "cu_dan":
+                if v_type == "XE_MAY":
+                    b["cu_dan_xemay"] += 1
+                else:
+                    b["cu_dan_oto"] += 1
+                b["cu_dan_tong"] += 1
+            elif guest == "vang_lai":
+                if v_type == "XE_MAY":
+                    b["vang_lai_xemay"] += 1
+                else:
+                    b["vang_lai_oto"] += 1
+                b["vang_lai_tong"] += 1
+
+        db = self._db()
+        conds = ["1=1"]
+        params: List[Any] = []
+        if start_date:
+            conds.append("ngay_ghi_nhan >= %s")
+            params.append(start_date[:10])
+        if end_date:
+            conds.append("ngay_ghi_nhan <= %s")
+            params.append(end_date[:10])
+        if ma_khu_vuc:
+            conds.append("ma_khu_vuc = %s")
+            params.append(ma_khu_vuc)
+
+        report_rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT ngay_ghi_nhan,
+                   COALESCE(SUM(so_luot_oto_vang_lai), 0) AS vl_oto,
+                   COALESCE(SUM(so_luot_xemay_vang_lai), 0) AS vl_xemay,
+                   COALESCE(SUM(so_luot_xe_cu_dan), 0) AS cd_tong
+            FROM bao_cao_luot_va_thu_phi
+            WHERE {" AND ".join(conds)}
+            GROUP BY ngay_ghi_nhan
+            ORDER BY ngay_ghi_nhan ASC
+            """,
+            tuple(params),
+        )
+        for rr in report_rows:
+            day = str(rr.get("ngay_ghi_nhan") or "")[:10]
+            if not day:
+                continue
+            b = by_day.setdefault(
+                day,
+                {
+                    "ngay": day,
+                    "cu_dan_oto": 0,
+                    "cu_dan_xemay": 0,
+                    "cu_dan_tong": 0,
+                    "vang_lai_oto": 0,
+                    "vang_lai_xemay": 0,
+                    "vang_lai_tong": 0,
+                },
+            )
+            rep_vl_oto = int(rr.get("vl_oto") or 0) if ma_loai_xe in ("", "O_TO") else 0
+            rep_vl_xm = int(rr.get("vl_xemay") or 0) if ma_loai_xe in ("", "XE_MAY") else 0
+            rep_cd = int(rr.get("cd_tong") or 0)
+            if rep_vl_oto > b["vang_lai_oto"]:
+                b["vang_lai_oto"] = rep_vl_oto
+            if rep_vl_xm > b["vang_lai_xemay"]:
+                b["vang_lai_xemay"] = rep_vl_xm
+            b["vang_lai_tong"] = b["vang_lai_oto"] + b["vang_lai_xemay"]
+            if rep_cd > b["cu_dan_tong"]:
+                b["cu_dan_tong"] = rep_cd
+
+        series = [by_day[k] for k in sorted(by_day.keys())]
+        tong_cd = sum(x["cu_dan_tong"] for x in series)
+        tong_vl = sum(x["vang_lai_tong"] for x in series)
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "ma_khu_vuc": ma_khu_vuc,
+            "ma_loai_xe": ma_loai_xe,
+            "cu_dan_oto": sum(x["cu_dan_oto"] for x in series),
+            "cu_dan_xemay": sum(x["cu_dan_xemay"] for x in series),
+            "tong_cu_dan": tong_cd,
+            "vang_lai_oto": sum(x["vang_lai_oto"] for x in series),
+            "vang_lai_xemay": sum(x["vang_lai_xemay"] for x in series),
+            "tong_vang_lai": tong_vl,
+            "series": series,
+        }
+
+    def handle_stats_revenue(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.8.3: Thống kê doanh thu theo ngày/tháng tách rõ phí cư dân và vãng lai."""
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        group_by = str(payload.get("group_by") or "day").strip().lower()
+        if group_by not in ("day", "month"):
+            group_by = "day"
+        ma_khu_vuc = str(payload.get("ma_khu_vuc") or "").strip().upper()
+
+        db = self._db()
+        by_period: Dict[str, Dict[str, Any]] = {}
+
+        def _period_key(date_text: str) -> str:
+            d = (date_text or "")[:10]
+            if not d:
+                return ""
+            return d[:7] if group_by == "month" else d
+
+        # 1. Doanh thu phí tháng cư dân (giao_dich_thanh_toan thành công)
+        tx_conds = ["trang_thai_giao_dich = %s"]
+        tx_params: List[Any] = [TransactionStatus.THANH_TOAN_THANH_CONG.value]
+        if start_date:
+            tx_conds.append("DATE(thoi_gian_giao_dich) >= %s")
+            tx_params.append(start_date[:10])
+        if end_date:
+            tx_conds.append("DATE(thoi_gian_giao_dich) <= %s")
+            tx_params.append(end_date[:10])
+
+        tx_rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT DATE(thoi_gian_giao_dich) AS ngay_gd,
+                   COALESCE(SUM(so_tien_thanh_toan), 0) AS tong_tien
+            FROM giao_dich_thanh_toan
+            WHERE {" AND ".join(tx_conds)}
+            GROUP BY DATE(thoi_gian_giao_dich)
+            ORDER BY ngay_gd ASC
+            """,
+            tuple(tx_params),
+        )
+        for tr in tx_rows:
+            pk = _period_key(str(tr.get("ngay_gd") or ""))
+            if not pk:
+                continue
+            bucket = by_period.setdefault(
+                pk, {"period": pk, "doanh_thu_cu_dan": 0.0, "doanh_thu_vang_lai": 0.0, "tong_doanh_thu": 0.0}
+            )
+            bucket["doanh_thu_cu_dan"] += float(tr.get("tong_tien") or 0)
+
+        # 2. Doanh thu khách vãng lai (bao_cao_luot_va_thu_phi + fallback parking_history)
+        rep_conds = ["1=1"]
+        rep_params: List[Any] = []
+        if start_date:
+            rep_conds.append("ngay_ghi_nhan >= %s")
+            rep_params.append(start_date[:10])
+        if end_date:
+            rep_conds.append("ngay_ghi_nhan <= %s")
+            rep_params.append(end_date[:10])
+        if ma_khu_vuc:
+            rep_conds.append("ma_khu_vuc = %s")
+            rep_params.append(ma_khu_vuc)
+
+        rep_rows = _safe_fetch_all(
+            db,
+            f"""
+            SELECT ngay_ghi_nhan,
+                   COALESCE(SUM(tong_tien_thu_vang_lai), 0) AS tien_vang_lai
+            FROM bao_cao_luot_va_thu_phi
+            WHERE {" AND ".join(rep_conds)}
+            GROUP BY ngay_ghi_nhan
+            ORDER BY ngay_ghi_nhan ASC
+            """,
+            tuple(rep_params),
+        )
+        report_visitor_by_period: Dict[str, float] = {}
+        for rr in rep_rows:
+            pk = _period_key(str(rr.get("ngay_ghi_nhan") or ""))
+            if pk:
+                report_visitor_by_period[pk] = report_visitor_by_period.get(pk, 0.0) + float(
+                    rr.get("tien_vang_lai") or 0
+                )
+
+        hist_visitor_by_period: Dict[str, float] = {}
+        for rec in self._query_all_parking_history(start_date, end_date, ma_khu_vuc):
+            if str(rec.get("loai_khach") or "").lower() != "vang_lai":
+                continue
+            out_day = str(rec.get("thoi_gian_ra") or rec.get("timestamp") or "")[:10]
+            if not out_day or not self._in_date_range(out_day, start_date, end_date):
+                continue
+            pk = _period_key(out_day)
+            if pk:
+                hist_visitor_by_period[pk] = hist_visitor_by_period.get(pk, 0.0) + float(
+                    rec.get("tien_thu") or 0
+                )
+
+        all_vis_periods = set(report_visitor_by_period.keys()) | set(hist_visitor_by_period.keys())
+        for pk in all_vis_periods:
+            vis_amount = max(
+                report_visitor_by_period.get(pk, 0.0),
+                hist_visitor_by_period.get(pk, 0.0),
+            )
+            bucket = by_period.setdefault(
+                pk, {"period": pk, "doanh_thu_cu_dan": 0.0, "doanh_thu_vang_lai": 0.0, "tong_doanh_thu": 0.0}
+            )
+            bucket["doanh_thu_vang_lai"] += vis_amount
+
+        series: List[Dict[str, Any]] = []
+        for pk in sorted(by_period.keys()):
+            b = by_period[pk]
+            b["tong_doanh_thu"] = b["doanh_thu_cu_dan"] + b["doanh_thu_vang_lai"]
+            series.append(b)
+
+        total_cd = sum(x["doanh_thu_cu_dan"] for x in series)
+        total_vl = sum(x["doanh_thu_vang_lai"] for x in series)
+        return {
+            "group_by": group_by,
+            "start_date": start_date,
+            "end_date": end_date,
+            "doanh_thu_cu_dan": total_cd,
+            "doanh_thu_vang_lai": total_vl,
+            "tong_doanh_thu": total_cd + total_vl,
+            "series": series,
+        }
+
 
 def register_monitor_admin_routes(
     router: Router,
@@ -913,6 +1265,27 @@ def register_monitor_admin_routes(
         Actions.MONITOR_OVERVIEW_MAP,
         handler.handle_monitor_overview_map,
         allowed_roles=[Roles.QUAN_LY.value, Roles.NHAN_VIEN.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.STATS_VEHICLE_TURNS,
+        handler.handle_stats_vehicle_turns,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.STATS_RESIDENT_VS_VISITOR,
+        handler.handle_stats_resident_vs_visitor,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.STATS_REVENUE,
+        handler.handle_stats_revenue,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
         require_auth=True,
     )
