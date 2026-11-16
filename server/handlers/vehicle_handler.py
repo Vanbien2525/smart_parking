@@ -1760,6 +1760,113 @@ class VehicleHandler:
         )
         return {"request": updated}
 
+    # ==========================================================================
+    # 1.4.19: QUẢN LÝ THU HỒI CHỖ ĐỖ ĐÃ CẤP KÈM KIỂM TRA AN TOÀN
+    # ==========================================================================
+    def handle_revoke_allocation(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.19: Thu hồi phân bổ chỗ đỗ (chặn tuyệt đối khi ô đang có xe bên trong)."""
+        try:
+            ma_phan_bo = int(payload.get("ma_phan_bo"))
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_phan_bo`.") from exc
+
+        ly_do_thu_hoi = str(payload.get("ly_do_thu_hoi") or payload.get("ly_do") or "").strip()
+        if not ly_do_thu_hoi:
+            raise BusinessError("Vui lòng nhập lý do thu hồi chỗ đỗ.")
+
+        db = self._db()
+        with db.transaction() as tx:
+            self._resolve_staff_id(tx, session)
+            alloc = tx.fetch_one(
+                "SELECT * FROM phan_bo_cho_do WHERE ma_phan_bo = %s FOR UPDATE",
+                (ma_phan_bo,),
+            )
+            if not alloc:
+                raise BusinessError(f"Không tìm thấy phân bổ chỗ đỗ #{ma_phan_bo}.")
+            if alloc["trang_thai_su_dung"] != SlotAllocationStatus.DANG_HIEU_LUC.value:
+                raise BusinessError("Phân bổ chỗ đỗ này đã được thu hồi trước đó.")
+
+            ma_can_ho = str(alloc["ma_can_ho"])
+            ma_vi_tri = str(alloc["ma_vi_tri"])
+
+            slot_row = tx.fetch_one(
+                "SELECT * FROM vi_tri_do WHERE ma_vi_tri = %s FOR UPDATE",
+                (ma_vi_tri,),
+            )
+            tracking = tx.fetch_one(
+                "SELECT * FROM quan_ly_phuong_tien_ra_vao WHERE ma_vi_tri_co_dinh = %s FOR UPDATE",
+                (ma_vi_tri,),
+            )
+            if (slot_row and slot_row["trang_thai_vi_tri"] == SlotStatus.DANG_CO_XE.value) or (
+                tracking and bool(tracking.get("dang_trong_bai"))
+            ):
+                raise BusinessError(
+                    f"Ô đỗ '{ma_vi_tri}' đang có xe đỗ bên trong, không thể thu hồi cho đến khi xe rời bãi!"
+                )
+
+            revoked_alloc = tx.execute_returning(
+                """
+                UPDATE phan_bo_cho_do
+                SET trang_thai_su_dung = %s,
+                    ly_do_thu_hoi = %s
+                WHERE ma_phan_bo = %s
+                RETURNING *
+                """,
+                (SlotAllocationStatus.DA_THU_HOI.value, ly_do_thu_hoi[:255], ma_phan_bo),
+            )
+            tx.execute(
+                """
+                UPDATE vi_tri_do
+                SET trang_thai_vi_tri = %s, thoi_gian_cap_nhat = CURRENT_TIMESTAMP
+                WHERE ma_vi_tri = %s
+                """,
+                (SlotStatus.TRONG.value, ma_vi_tri),
+            )
+
+            apt_updated = None
+            if alloc["loai_cho_cap"] == SlotAllocationTypes.CHO_MUA_THEM.value:
+                apt_updated = tx.execute_returning(
+                    """
+                    UPDATE can_ho
+                    SET so_cho_oto_mua_them = GREATEST(0, so_cho_oto_mua_them - 1)
+                    WHERE ma_can_ho = %s
+                    RETURNING ma_can_ho, so_cho_oto_mac_dinh, so_cho_oto_mua_them
+                    """,
+                    (ma_can_ho,),
+                )
+
+            if tracking:
+                tx.execute(
+                    """
+                    UPDATE quan_ly_phuong_tien_ra_vao
+                    SET ma_vi_tri_co_dinh = NULL, ma_khu_vuc_phan_cong = NULL
+                    WHERE ma_quan_ly_xe = %s
+                    """,
+                    (tracking["ma_quan_ly_xe"],),
+                )
+                tx.execute(
+                    "UPDATE phuong_tien SET trang_thai_xe = %s WHERE ma_phuong_tien = %s",
+                    (VehicleStatus.NGUNG_HOAT_DONG.value, tracking["ma_phuong_tien"]),
+                )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="THU_HOI_CHO_DO",
+            doi_tuong="phan_bo_cho_do",
+            ma_doi_tuong=ma_phan_bo,
+            gia_tri_cu={"ma_can_ho": ma_can_ho, "ma_vi_tri": ma_vi_tri, "loai_cho_cap": alloc["loai_cho_cap"]},
+            gia_tri_moi={"trang_thai_su_dung": SlotAllocationStatus.DA_THU_HOI.value, "ly_do_thu_hoi": ly_do_thu_hoi[:255]},
+        )
+        return {
+            "allocation": revoked_alloc,
+            "apartment": apt_updated,
+            "ma_vi_tri": ma_vi_tri,
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1842,6 +1949,12 @@ def register_vehicle_routes(
     router.register(
         Actions.SLOT_REQUEST_REJECT,
         handler.handle_reject_extra_slot,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+    )
+    router.register(
+        Actions.ALLOCATION_REVOKE,
+        handler.handle_revoke_allocation,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
     )
