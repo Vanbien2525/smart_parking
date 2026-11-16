@@ -9,12 +9,15 @@ from server.core.file_logger import FileLogger
 from server.core.router import BusinessError, Router
 from server.core.session_manager import ClientSession, SessionManager
 from shared.constants import (
+    AccountStatus,
+    NotifyAckStatus,
     NotifyLevels,
     NotifyRecipientGroups,
+    NotifySendStatus,
     NotifyTypes,
     Roles,
 )
-from shared.protocol import Actions
+from shared.protocol import Actions, PushEvents
 
 _VALID_TYPES = {e.value for e in NotifyTypes}
 _VALID_LEVELS = {e.value for e in NotifyLevels}
@@ -131,6 +134,372 @@ class NotifyHandler:
         items.sort(key=lambda d: str(d.get("updated_at") or ""), reverse=True)
         return [dict(d) for d in items]
 
+    def _resolve_sender_nhan_vien_id(self, db: Any, session: ClientSession) -> int:
+        if session.ma_nhan_vien is not None:
+            return int(session.ma_nhan_vien)
+        if session.ma_tai_khoan is not None:
+            row = db.fetch_one(
+                "SELECT ma_nhan_vien FROM nhan_vien WHERE ma_tai_khoan = %s",
+                (int(session.ma_tai_khoan),),
+            )
+            if row and row.get("ma_nhan_vien") is not None:
+                return int(row["ma_nhan_vien"])
+        raise BusinessError("Tài khoản hiện tại chưa gắn hồ sơ nhân viên/quản lý để gửi thông báo.")
+
+    @staticmethod
+    def _resolve_push_event(loai_thong_bao: str, muc_do: str) -> str:
+        if (
+            loai_thong_bao == NotifyTypes.KHAN_CAP.value
+            or muc_do == NotifyLevels.KHAN_CAP.value
+        ):
+            return PushEvents.EMERGENCY_ALERT
+        return PushEvents.NORMAL_NOTIFICATION
+
+    def _fetch_target_accounts(
+        self,
+        db: Any,
+        nhom_nguoi_nhan: str,
+        ma_tai_khoan_ca_nhan: Optional[int],
+        sender_account_id: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        if nhom_nguoi_nhan == NotifyRecipientGroups.CA_NHAN.value:
+            return db.fetch_all(
+                """
+                SELECT ma_tai_khoan, ten_dang_nhap, vai_tro
+                FROM tai_khoan
+                WHERE ma_tai_khoan = %s AND trang_thai = %s
+                """,
+                (ma_tai_khoan_ca_nhan, AccountStatus.HOAT_DONG.value),
+            )
+        if nhom_nguoi_nhan == NotifyRecipientGroups.CU_DAN.value:
+            return db.fetch_all(
+                """
+                SELECT ma_tai_khoan, ten_dang_nhap, vai_tro
+                FROM tai_khoan
+                WHERE vai_tro = %s AND trang_thai = %s
+                ORDER BY ma_tai_khoan ASC
+                """,
+                (Roles.CU_DAN.value, AccountStatus.HOAT_DONG.value),
+            )
+        if nhom_nguoi_nhan == NotifyRecipientGroups.NHAN_VIEN.value:
+            return db.fetch_all(
+                """
+                SELECT ma_tai_khoan, ten_dang_nhap, vai_tro
+                FROM tai_khoan
+                WHERE vai_tro = %s AND trang_thai = %s
+                ORDER BY ma_tai_khoan ASC
+                """,
+                (Roles.NHAN_VIEN.value, AccountStatus.HOAT_DONG.value),
+            )
+        # tat_ca: toàn bộ tài khoản đang hoạt động (trừ chính người gửi nếu có tài khoản khác)
+        rows = db.fetch_all(
+            """
+            SELECT ma_tai_khoan, ten_dang_nhap, vai_tro
+            FROM tai_khoan
+            WHERE trang_thai = %s
+            ORDER BY ma_tai_khoan ASC
+            """,
+            (AccountStatus.HOAT_DONG.value,),
+        )
+        if sender_account_id is not None:
+            filtered = [r for r in rows if int(r["ma_tai_khoan"]) != int(sender_account_id)]
+            if filtered:
+                return filtered
+        return rows
+
+    def _has_broken_socket(self, account_id: int, push_result: Dict[str, List[int]]) -> bool:
+        """Kiểm tra tài khoản có đang mở session nhưng gửi socket thất bại hay không."""
+        active_for_user = [
+            s
+            for s in self.session_manager.list_sessions(authenticated_only=True)
+            if s.get("ma_tai_khoan") == account_id
+        ]
+        return bool(active_for_user) and account_id in push_result.get("gui_that_bai", [])
+
+    # ==========================================================================
+    # 1.10.2: PHÁT THÔNG BÁO PUSH REAL-TIME & THỬ GỬI LẠI (WORKFLOW 01)
+    # ==========================================================================
+    def handle_publish(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.10.2: Lưu CSDL bảng 17-18, đẩy Socket Push tới người nhận và tổng hợp trạng thái."""
+        draft_id = str(payload.get("draft_id") or "").strip()
+        merged_payload = dict(payload)
+        if draft_id:
+            draft = self.get_draft(draft_id)
+            if draft is None:
+                raise BusinessError(f"Không tìm thấy bản nháp '{draft_id}'.")
+            for k in (
+                "tieu_de",
+                "noi_dung",
+                "loai_thong_bao",
+                "muc_do",
+                "nhom_nguoi_nhan",
+                "ma_tai_khoan_ca_nhan",
+            ):
+                if merged_payload.get(k) in (None, ""):
+                    merged_payload[k] = draft.get(k)
+
+        fields = self._validate_notify_fields(merged_payload)
+        db = self._db()
+        ma_nguoi_gui = self._resolve_sender_nhan_vien_id(db, session)
+
+        raw_sim_fail = payload.get("simulate_failed_account_ids") or []
+        sim_failed_ids = {int(x) for x in raw_sim_fail if x not in (None, "")}
+
+        with db.transaction() as tx:
+            targets = self._fetch_target_accounts(
+                tx,
+                nhom_nguoi_nhan=fields["nhom_nguoi_nhan"],
+                ma_tai_khoan_ca_nhan=fields["ma_tai_khoan_ca_nhan"],
+                sender_account_id=session.ma_tai_khoan,
+            )
+            if not targets:
+                raise BusinessError("Không tìm thấy tài khoản người nhận đang hoạt động phù hợp.")
+
+            thong_bao = tx.execute_returning(
+                """
+                INSERT INTO thong_bao (
+                    ma_nguoi_gui, tieu_de, noi_dung, loai_thong_bao, muc_do, nhom_nguoi_nhan, thoi_gian_gui
+                ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                RETURNING ma_thong_bao, ma_nguoi_gui, tieu_de, noi_dung, loai_thong_bao, muc_do, nhom_nguoi_nhan, thoi_gian_gui
+                """,
+                (
+                    ma_nguoi_gui,
+                    fields["tieu_de"],
+                    fields["noi_dung"],
+                    fields["loai_thong_bao"],
+                    fields["muc_do"],
+                    fields["nhom_nguoi_nhan"],
+                ),
+            )
+            ma_thong_bao = int(thong_bao["ma_thong_bao"])
+
+            push_event = self._resolve_push_event(fields["loai_thong_bao"], fields["muc_do"])
+            push_data = {
+                "ma_thong_bao": ma_thong_bao,
+                "tieu_de": fields["tieu_de"],
+                "noi_dung": fields["noi_dung"],
+                "loai_thong_bao": fields["loai_thong_bao"],
+                "muc_do": fields["muc_do"],
+                "nhom_nguoi_nhan": fields["nhom_nguoi_nhan"],
+                "ten_nguoi_gui": session.ho_ten or session.ten_dang_nhap or "Ban Quản Lý",
+                "thoi_gian_gui": str(thong_bao.get("thoi_gian_gui") or datetime.now().isoformat(timespec="seconds")),
+            }
+
+            push_candidate_ids = [
+                int(t["ma_tai_khoan"])
+                for t in targets
+                if int(t["ma_tai_khoan"]) not in sim_failed_ids
+            ]
+            push_result = self.session_manager.push_to_users(push_candidate_ids, push_event, push_data)
+
+            recipient_rows: List[Dict[str, Any]] = []
+            success_count = 0
+            failed_count = 0
+            online_pushed_count = 0
+
+            for target in targets:
+                acc_id = int(target["ma_tai_khoan"])
+                is_failed = acc_id in sim_failed_ids or self._has_broken_socket(acc_id, push_result)
+                send_status = (
+                    NotifySendStatus.GUI_THAT_BAI.value
+                    if is_failed
+                    else NotifySendStatus.GUI_THANH_CONG.value
+                )
+                if is_failed:
+                    failed_count += 1
+                else:
+                    success_count += 1
+                    if acc_id in push_result.get("gui_thanh_cong", []):
+                        online_pushed_count += 1
+
+                rec = tx.execute_returning(
+                    """
+                    INSERT INTO nguoi_nhan_thong_bao (
+                        ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui, so_lan_gui_lai,
+                        trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+                    ) VALUES (%s, %s, %s, 0, %s, FALSE, NULL)
+                    RETURNING ma_tiep_nhan, ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui,
+                              so_lan_gui_lai, trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+                    """,
+                    (
+                        ma_thong_bao,
+                        acc_id,
+                        send_status,
+                        NotifyAckStatus.CHUA_TIEP_NHAN.value,
+                    ),
+                )
+                recipient_rows.append(rec)
+
+        if draft_id:
+            with self._draft_lock:
+                self._drafts.pop(draft_id, None)
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="PHAT_THONG_BAO",
+            doi_tuong="thong_bao",
+            ma_doi_tuong=ma_thong_bao,
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "tieu_de": fields["tieu_de"],
+                "loai_thong_bao": fields["loai_thong_bao"],
+                "muc_do": fields["muc_do"],
+                "nhom_nguoi_nhan": fields["nhom_nguoi_nhan"],
+                "tong_nguoi_nhan": len(recipient_rows),
+                "gui_thanh_cong": success_count,
+                "gui_that_bai": failed_count,
+            },
+        )
+
+        return {
+            "thong_bao": thong_bao,
+            "push_event": push_event,
+            "tong_nguoi_nhan": len(recipient_rows),
+            "so_gui_thanh_cong": success_count,
+            "so_gui_that_bai": failed_count,
+            "so_online_da_push": online_pushed_count,
+            "so_da_tiep_nhan": 0,
+            "so_chua_tiep_nhan": len(recipient_rows),
+            "recipients": recipient_rows,
+        }
+
+    def handle_retry_failed(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.10.2 (Retry): Gửi lại thông báo tới các người nhận gui_that_bai (hoặc chua_tiep_nhan)."""
+        raw_id = payload.get("ma_thong_bao")
+        if raw_id in (None, ""):
+            raise BusinessError("Thiếu `ma_thong_bao` để thử gửi lại.")
+        try:
+            ma_thong_bao = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("`ma_thong_bao` phải là số nguyên.") from exc
+
+        include_unacked = bool(payload.get("include_unacked", False))
+        raw_sim_fail = payload.get("simulate_failed_account_ids") or []
+        sim_failed_ids = {int(x) for x in raw_sim_fail if x not in (None, "")}
+
+        db = self._db()
+        with db.transaction() as tx:
+            tb = tx.fetch_one(
+                """
+                SELECT ma_thong_bao, ma_nguoi_gui, tieu_de, noi_dung, loai_thong_bao,
+                       muc_do, nhom_nguoi_nhan, thoi_gian_gui
+                FROM thong_bao
+                WHERE ma_thong_bao = %s
+                """,
+                (ma_thong_bao,),
+            )
+            if tb is None:
+                raise BusinessError(f"Không tìm thấy thông báo mã {ma_thong_bao}.")
+
+            rows = tx.fetch_all(
+                """
+                SELECT ma_tiep_nhan, ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui,
+                       so_lan_gui_lai, trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+                FROM nguoi_nhan_thong_bao
+                WHERE ma_thong_bao = %s
+                ORDER BY ma_tiep_nhan ASC
+                """,
+                (ma_thong_bao,),
+            )
+            retry_targets = [
+                r
+                for r in rows
+                if r.get("trang_thai_gui") == NotifySendStatus.GUI_THAT_BAI.value
+                or (
+                    include_unacked
+                    and r.get("trang_thai_tiep_nhan") == NotifyAckStatus.CHUA_TIEP_NHAN.value
+                )
+            ]
+            if not retry_targets:
+                return {
+                    "ma_thong_bao": ma_thong_bao,
+                    "retried_count": 0,
+                    "so_gui_thanh_cong": 0,
+                    "so_gui_that_bai": 0,
+                    "recipients": [],
+                }
+
+            push_event = self._resolve_push_event(
+                str(tb.get("loai_thong_bao") or ""),
+                str(tb.get("muc_do") or ""),
+            )
+            push_data = {
+                "ma_thong_bao": ma_thong_bao,
+                "tieu_de": tb.get("tieu_de"),
+                "noi_dung": tb.get("noi_dung"),
+                "loai_thong_bao": tb.get("loai_thong_bao"),
+                "muc_do": tb.get("muc_do"),
+                "nhom_nguoi_nhan": tb.get("nhom_nguoi_nhan"),
+                "ten_nguoi_gui": session.ho_ten or session.ten_dang_nhap or "Ban Quản Lý",
+                "thoi_gian_gui": str(tb.get("thoi_gian_gui") or ""),
+                "is_retry": True,
+            }
+
+            candidate_ids = [
+                int(r["ma_tai_khoan_nhan"])
+                for r in retry_targets
+                if int(r["ma_tai_khoan_nhan"]) not in sim_failed_ids
+            ]
+            push_result = self.session_manager.push_to_users(candidate_ids, push_event, push_data)
+
+            updated_rows: List[Dict[str, Any]] = []
+            success_count = 0
+            failed_count = 0
+            for rec in retry_targets:
+                acc_id = int(rec["ma_tai_khoan_nhan"])
+                is_failed = acc_id in sim_failed_ids or self._has_broken_socket(acc_id, push_result)
+                new_status = (
+                    NotifySendStatus.GUI_THAT_BAI.value
+                    if is_failed
+                    else NotifySendStatus.GUI_THANH_CONG.value
+                )
+                if is_failed:
+                    failed_count += 1
+                else:
+                    success_count += 1
+
+                updated = tx.execute_returning(
+                    """
+                    UPDATE nguoi_nhan_thong_bao
+                    SET so_lan_gui_lai = so_lan_gui_lai + 1,
+                        trang_thai_gui = %s
+                    WHERE ma_tiep_nhan = %s
+                    RETURNING ma_tiep_nhan, ma_thong_bao, ma_tai_khoan_nhan, trang_thai_gui,
+                              so_lan_gui_lai, trang_thai_tiep_nhan, da_doc, thoi_gian_tiep_nhan
+                    """,
+                    (new_status, int(rec["ma_tiep_nhan"])),
+                )
+                updated_rows.append(updated)
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GUI_LAI_THONG_BAO",
+            doi_tuong="thong_bao",
+            ma_doi_tuong=ma_thong_bao,
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "retried_count": len(updated_rows),
+                "so_gui_thanh_cong": success_count,
+                "so_gui_that_bai": failed_count,
+            },
+        )
+
+        return {
+            "ma_thong_bao": ma_thong_bao,
+            "retried_count": len(updated_rows),
+            "so_gui_thanh_cong": success_count,
+            "so_gui_that_bai": failed_count,
+            "recipients": updated_rows,
+        }
+
 
 def register_notify_routes(
     router: Router,
@@ -147,6 +516,20 @@ def register_notify_routes(
     router.register(
         Actions.NOTIFY_SAVE_DRAFT,
         handler.handle_save_draft,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_PUBLISH,
+        handler.handle_publish,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_RETRY_FAILED,
+        handler.handle_retry_failed,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
         require_auth=True,
