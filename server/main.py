@@ -66,6 +66,38 @@ def _register_available_handlers(ctx: ServerContext) -> None:
     except ImportError:
         pass
 
+    try:
+        from server.handlers.auth_handler import register_auth_hr_routes
+
+        register_auth_hr_routes(
+            ctx.router,
+            session_manager=ctx.session_manager,
+            file_logger=ctx.file_logger,
+            otp_service=ctx.otp_service,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from server.handlers.infra_handler import register_infra_pricing_routes
+
+        register_infra_pricing_routes(
+            ctx.router,
+            file_logger=ctx.file_logger,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from server.handlers.billing_handler import register_billing_routes
+
+        register_billing_routes(
+            ctx.router,
+            file_logger=ctx.file_logger,
+        )
+    except ImportError:
+        pass
+
 
 def create_socket_server(
     config: Optional[ServerConfig] = None,
@@ -86,6 +118,29 @@ def create_socket_server(
 
 def main() -> int:
     server, ctx = create_socket_server()
+
+    # Khởi tạo PostgreSQL Pool & tự động đồng bộ hóa đơn tháng hiện tại nếu DB sẵn sàng
+    try:
+        from server import db
+        from server.handlers.billing_handler import BillingHandler
+
+        db.init_pool(ctx.config)
+        if db.is_pool_ready():
+            billing = BillingHandler(file_logger=ctx.file_logger)
+            res = billing.generate_monthly_invoices()
+            print(
+                f"[SmartParking Server] Đã đồng bộ hóa đơn kỳ {res['ky_thu_thang_nam']} "
+                f"(tạo mới: {res['created']}, cập nhật: {res['updated']})"
+            )
+    except Exception as exc:
+        ctx.file_logger.log_error(
+            noi_dung=f"Chưa kết nối được PostgreSQL khi khởi động: {exc}",
+            muc_do=LogLevels.WARN,
+            nguon="server.main",
+            ma_loi="DB_INIT_WARN",
+        )
+        print(f"[SmartParking Server] Cảnh báo CSDL: {exc}")
+
     print(
         f"[SmartParking Server] Đang lắng nghe tại {ctx.config.server_host}:{server.bound_port} "
         f"(heartbeat timeout={ctx.config.heartbeat_timeout_seconds}s)"
@@ -115,6 +170,12 @@ def main() -> int:
     finally:
         print("\n[SmartParking Server] Đang dừng máy chủ an toàn...")
         server.stop()
+        try:
+            from server import db
+
+            db.close_pool()
+        except Exception:
+            pass
         print("[SmartParking Server] Đã dừng hoàn toàn.")
     return 0
 
