@@ -1,7 +1,7 @@
 """Handler Xác thực (1.2, 2.1, 3.1, 4.1), OTP Email 4 bước & Quản lý Nhân sự (1.3)."""
 
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
 
@@ -665,6 +665,121 @@ class AuthHRHandler:
             "auto_created_apartment": auto_created_apartment,
         }
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.3.2 & 1.3.3: TÌM KIẾM & XEM CHI TIẾT TÀI KHOẢN CƯ DÂN
+    # ==========================================================================
+    def handle_search_residents(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.2: Tìm kiếm cư dân theo tên, mã căn hộ, mã cư dân, trạng thái."""
+        keyword = str(payload.get("keyword") or payload.get("ho_ten") or "").strip()
+        ma_can_ho = str(payload.get("ma_can_ho") or "").strip()
+        ma_cu_dan = payload.get("ma_cu_dan")
+        trang_thai = str(payload.get("trang_thai") or "").strip()
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append(
+                "(cd.ho_ten ILIKE %s OR tk.ten_dang_nhap ILIKE %s "
+                "OR cd.email ILIKE %s OR cd.so_dien_thoai ILIKE %s OR cd.ma_can_ho ILIKE %s)"
+            )
+            params.extend([like, like, like, like, like])
+        if ma_can_ho:
+            conditions.append("cd.ma_can_ho ILIKE %s")
+            params.append(f"%{ma_can_ho}%")
+        if ma_cu_dan not in (None, ""):
+            try:
+                conditions.append("cd.ma_cu_dan = %s")
+                params.append(int(ma_cu_dan))
+            except (TypeError, ValueError) as exc:
+                raise BusinessError("Mã cư dân phải là số nguyên.") from exc
+        if trang_thai:
+            conditions.append("tk.trang_thai = %s")
+            params.append(trang_thai)
+
+        where_sql = " AND ".join(conditions)
+        db = self._db()
+        rows = db.fetch_all(
+            f"""
+            SELECT cd.ma_cu_dan,
+                   cd.ma_tai_khoan,
+                   cd.ma_can_ho,
+                   cd.ho_ten,
+                   cd.so_cccd,
+                   cd.so_dien_thoai,
+                   cd.email,
+                   cd.dia_chi,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   tk.trang_thai,
+                   tk.ly_do_khoa,
+                   tk.ngay_tao,
+                   ch.toa_nha,
+                   ch.so_tang,
+                   ch.so_cho_oto_mac_dinh,
+                   ch.so_cho_oto_mua_them
+            FROM cu_dan cd
+            JOIN tai_khoan tk ON tk.ma_tai_khoan = cd.ma_tai_khoan
+            JOIN can_ho ch ON ch.ma_can_ho = cd.ma_can_ho
+            WHERE {where_sql}
+            ORDER BY cd.ma_cu_dan ASC
+            """,
+            tuple(params),
+        )
+        apartments = db.fetch_all(
+            "SELECT ma_can_ho, toa_nha, so_tang FROM can_ho ORDER BY ma_can_ho ASC"
+        )
+        return {
+            "total": len(rows),
+            "items": rows,
+            "apartments": apartments,
+        }
+
+    def handle_get_resident(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.3: Xem chi tiết hồ sơ cư dân, căn hộ và trạng thái tài khoản."""
+        ma_cu_dan = payload.get("ma_cu_dan")
+        ma_tai_khoan = payload.get("ma_tai_khoan")
+        if ma_cu_dan is None and ma_tai_khoan is None:
+            raise BusinessError("Vui lòng cung cấp `ma_cu_dan` hoặc `ma_tai_khoan`.")
+
+        db = self._db()
+        if ma_cu_dan is not None:
+            row = db.fetch_one(
+                """
+                SELECT cd.ma_cu_dan, cd.ma_tai_khoan, cd.ma_can_ho, cd.ho_ten,
+                       cd.so_cccd, cd.so_dien_thoai, cd.email, cd.dia_chi,
+                       tk.ten_dang_nhap, tk.vai_tro, tk.trang_thai, tk.ly_do_khoa, tk.ngay_tao,
+                       ch.toa_nha, ch.so_tang, ch.so_cho_oto_mac_dinh, ch.so_cho_oto_mua_them, ch.trang_thai_can_ho
+                FROM cu_dan cd
+                JOIN tai_khoan tk ON tk.ma_tai_khoan = cd.ma_tai_khoan
+                JOIN can_ho ch ON ch.ma_can_ho = cd.ma_can_ho
+                WHERE cd.ma_cu_dan = %s
+                """,
+                (int(ma_cu_dan),),
+            )
+        else:
+            row = db.fetch_one(
+                """
+                SELECT cd.ma_cu_dan, cd.ma_tai_khoan, cd.ma_can_ho, cd.ho_ten,
+                       cd.so_cccd, cd.so_dien_thoai, cd.email, cd.dia_chi,
+                       tk.ten_dang_nhap, tk.vai_tro, tk.trang_thai, tk.ly_do_khoa, tk.ngay_tao,
+                       ch.toa_nha, ch.so_tang, ch.so_cho_oto_mac_dinh, ch.so_cho_oto_mua_them, ch.trang_thai_can_ho
+                FROM cu_dan cd
+                JOIN tai_khoan tk ON tk.ma_tai_khoan = cd.ma_tai_khoan
+                JOIN can_ho ch ON ch.ma_can_ho = cd.ma_can_ho
+                WHERE cd.ma_tai_khoan = %s
+                """,
+                (int(ma_tai_khoan),),
+            )
+
+        if not row:
+            raise BusinessError("Không tìm thấy hồ sơ cư dân.")
+        return {"resident": row}
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -748,6 +863,20 @@ def register_auth_hr_routes(
         handler.handle_create_resident,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_SEARCH_RESIDENTS,
+        handler.handle_search_residents,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_GET_RESIDENT,
+        handler.handle_get_resident,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
         require_auth=True,
     )
     return handler
