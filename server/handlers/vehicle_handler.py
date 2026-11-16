@@ -1587,6 +1587,179 @@ class VehicleHandler:
             "allocations": allocations,
         }
 
+    # ==========================================================================
+    # 1.4.16 & 1.4.17: DUYỆT CẤP Ô ĐỖ MUA THÊM & TỪ CHỐI YÊU CẦU MUA THÊM CHỖ
+    # ==========================================================================
+    def handle_approve_extra_slot(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.16: Duyệt yêu cầu mua thêm chỗ đỗ ô tô, cấp ô đỗ & tăng hạn mức căn hộ ACID."""
+        try:
+            ma_yeu_cau_cho = int(payload.get("ma_yeu_cau_cho"))
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_yeu_cau_cho`.") from exc
+
+        ma_vi_tri = str(
+            payload.get("ma_vi_tri")
+            or payload.get("ma_vi_tri_duoc_duyet")
+            or ""
+        ).strip().upper()
+        if not ma_vi_tri:
+            raise BusinessError("Vui lòng chọn ô đỗ ô tô trống để cấp cho căn hộ.")
+
+        db = self._db()
+        with db.transaction() as tx:
+            staff_id = self._resolve_staff_id(tx, session)
+            req = tx.fetch_one(
+                "SELECT * FROM yeu_cau_mua_them_cho WHERE ma_yeu_cau_cho = %s FOR UPDATE",
+                (ma_yeu_cau_cho,),
+            )
+            if not req:
+                raise BusinessError(f"Không tìm thấy yêu cầu mua thêm chỗ #{ma_yeu_cau_cho}.")
+            if req["trang_thai_duyet"] != RequestStatus.CHO_DUYET.value:
+                raise BusinessError("Yêu cầu mua thêm chỗ này đã được xử lý trước đó.")
+
+            slot_row = tx.fetch_one(
+                """
+                SELECT vt.*, kv.ma_loai_xe, kv.trang_thai_khu_vuc
+                FROM vi_tri_do vt
+                JOIN khu_vuc kv ON kv.ma_khu_vuc = vt.ma_khu_vuc
+                WHERE vt.ma_vi_tri = %s
+                FOR UPDATE OF vt
+                """,
+                (ma_vi_tri,),
+            )
+            if not slot_row:
+                raise BusinessError(f"Không tìm thấy vị trí đỗ '{ma_vi_tri}'.")
+            if slot_row["ma_loai_xe"] != VehicleTypes.O_TO.value:
+                raise BusinessError(f"Vị trí '{ma_vi_tri}' không thuộc khu vực ô tô.")
+            if slot_row["trang_thai_khu_vuc"] != ZoneStatus.HOAT_DONG.value:
+                raise BusinessError(f"Khu vực của vị trí '{ma_vi_tri}' đang ngừng sử dụng.")
+            if slot_row["nhom_vi_tri"] == "vi_tri_vang_lai":
+                raise BusinessError(f"Ô '{ma_vi_tri}' là ô vãng lai, không thể bán cho cư dân.")
+            if slot_row["trang_thai_vi_tri"] != SlotStatus.TRONG.value:
+                raise BusinessError(
+                    f"Ô đỗ '{ma_vi_tri}' hiện ở trạng thái '{slot_row['trang_thai_vi_tri']}', không còn trống."
+                )
+
+            ma_can_ho = str(req["ma_can_ho"])
+            tx.fetch_one("SELECT ma_can_ho FROM can_ho WHERE ma_can_ho = %s FOR UPDATE", (ma_can_ho,))
+
+            alloc = tx.execute_returning(
+                """
+                INSERT INTO phan_bo_cho_do (
+                    ma_can_ho, ma_vi_tri, loai_cho_cap, trang_thai_su_dung
+                ) VALUES (%s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    ma_can_ho,
+                    ma_vi_tri,
+                    SlotAllocationTypes.CHO_MUA_THEM.value,
+                    SlotAllocationStatus.DANG_HIEU_LUC.value,
+                ),
+            )
+            tx.execute(
+                """
+                UPDATE vi_tri_do
+                SET trang_thai_vi_tri = %s, thoi_gian_cap_nhat = CURRENT_TIMESTAMP
+                WHERE ma_vi_tri = %s
+                """,
+                (SlotStatus.DA_PHAN_CHO.value, ma_vi_tri),
+            )
+            apt_updated = tx.execute_returning(
+                """
+                UPDATE can_ho
+                SET so_cho_oto_mua_them = so_cho_oto_mua_them + 1
+                WHERE ma_can_ho = %s
+                RETURNING ma_can_ho, so_cho_oto_mac_dinh, so_cho_oto_mua_them
+                """,
+                (ma_can_ho,),
+            )
+            req_updated = tx.execute_returning(
+                """
+                UPDATE yeu_cau_mua_them_cho
+                SET trang_thai_duyet = %s,
+                    ma_vi_tri_duoc_duyet = %s,
+                    ma_nhan_vien_duyet = %s
+                WHERE ma_yeu_cau_cho = %s
+                RETURNING *
+                """,
+                (RequestStatus.DA_DUYET.value, ma_vi_tri, staff_id, ma_yeu_cau_cho),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="DUYET_MUA_THEM_CHO_DO",
+            doi_tuong="yeu_cau_mua_them_cho",
+            ma_doi_tuong=ma_yeu_cau_cho,
+            gia_tri_cu={"trang_thai_duyet": RequestStatus.CHO_DUYET.value},
+            gia_tri_moi={
+                "trang_thai_duyet": RequestStatus.DA_DUYET.value,
+                "ma_can_ho": ma_can_ho,
+                "ma_vi_tri_duoc_duyet": ma_vi_tri,
+                "so_cho_oto_mua_them": apt_updated["so_cho_oto_mua_them"] if apt_updated else None,
+            },
+        )
+        return {
+            "request": req_updated,
+            "allocation": alloc,
+            "apartment": apt_updated,
+        }
+
+    def handle_reject_extra_slot(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.4.17: Từ chối yêu cầu mua thêm chỗ đỗ ô tô kèm lý do."""
+        try:
+            ma_yeu_cau_cho = int(payload.get("ma_yeu_cau_cho"))
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_yeu_cau_cho`.") from exc
+
+        ly_do = str(
+            payload.get("ly_do_tu_choi") or payload.get("ly_do_phan_hoi") or ""
+        ).strip()
+        if not ly_do:
+            raise BusinessError("Vui lòng nhập lý do từ chối yêu cầu mua thêm chỗ.")
+
+        db = self._db()
+        with db.transaction() as tx:
+            staff_id = self._resolve_staff_id(tx, session)
+            req = tx.fetch_one(
+                "SELECT * FROM yeu_cau_mua_them_cho WHERE ma_yeu_cau_cho = %s FOR UPDATE",
+                (ma_yeu_cau_cho,),
+            )
+            if not req:
+                raise BusinessError(f"Không tìm thấy yêu cầu mua thêm chỗ #{ma_yeu_cau_cho}.")
+            if req["trang_thai_duyet"] != RequestStatus.CHO_DUYET.value:
+                raise BusinessError("Yêu cầu này đã được xử lý trước đó.")
+
+            updated = tx.execute_returning(
+                """
+                UPDATE yeu_cau_mua_them_cho
+                SET trang_thai_duyet = %s,
+                    ma_nhan_vien_duyet = %s,
+                    ly_do_tu_choi = %s
+                WHERE ma_yeu_cau_cho = %s
+                RETURNING *
+                """,
+                (RequestStatus.TU_CHOI.value, staff_id, ly_do[:255], ma_yeu_cau_cho),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="TU_CHOI_MUA_THEM_CHO_DO",
+            doi_tuong="yeu_cau_mua_them_cho",
+            ma_doi_tuong=ma_yeu_cau_cho,
+            gia_tri_cu={"trang_thai_duyet": RequestStatus.CHO_DUYET.value},
+            gia_tri_moi={"trang_thai_duyet": RequestStatus.TU_CHOI.value, "ly_do_tu_choi": ly_do[:255]},
+        )
+        return {"request": updated}
+
 
 def register_vehicle_routes(
     router: Router,
@@ -1659,5 +1832,17 @@ def register_vehicle_routes(
         handler.handle_manager_list_extra_slots,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
+    )
+    router.register(
+        Actions.SLOT_REQUEST_APPROVE,
+        handler.handle_approve_extra_slot,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+    )
+    router.register(
+        Actions.SLOT_REQUEST_REJECT,
+        handler.handle_reject_extra_slot,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
     )
     return handler
