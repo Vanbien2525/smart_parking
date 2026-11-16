@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -35,7 +36,18 @@ from client.ui.manager.dashboard_view import DashboardView
 from client.ui.manager.finance_view import FinanceView
 from client.ui.manager.hr_view import HRView
 from client.ui.manager.infra_pricing_view import InfraPricingView
+from client.ui.manager.stats_history_view import (
+    ManagerHistoryView,
+    ManagerMonitorView,
+    ManagerNotifyView,
+    ManagerStatsView,
+)
 from client.ui.resident.bills_payment_view import BillsPaymentView
+from client.ui.resident.resident_notify_view import ResidentNotifyView
+from client.ui.staff.staff_monitor_notify_view import (
+    StaffMonitorView,
+    StaffNotifyInboxView,
+)
 from client.ui.theme.components import (
     EmergencyBanner,
     EmergencyDialog,
@@ -326,6 +338,20 @@ class MainWindow(QMainWindow):
 
     def _populate_manager_pages(self) -> None:
         ex = self._extra_views
+        finance_ro = ex.get("4.7_finance_ro")
+        if finance_ro is None:
+            fin_tabs = QTabWidget()
+            fin_tabs.addTab(ManagerStatsView(socket_client=self.socket_client, read_only=True), "4.7.1–4.7.3 Thống kê & Doanh thu")
+            fin_tabs.addTab(FinanceView(socket_client=self.socket_client, read_only=True), "4.7.4 Thu phí & Công nợ")
+            finance_ro = fin_tabs
+
+        parking_ro = ex.get("4.8_parking_ro")
+        if parking_ro is None:
+            park_tabs = QTabWidget()
+            park_tabs.addTab(ManagerMonitorView(socket_client=self.socket_client, read_only=True), "4.8.1–4.8.2 Giám sát bãi 2D/3D")
+            park_tabs.addTab(ManagerHistoryView(socket_client=self.socket_client, read_only=True), "4.8.3 Lịch sử xe vào/ra")
+            parking_ro = park_tabs
+
         specs = [
             ("1.1_dashboard", "1.1 Dashboard tổng quan", "Dashboard Quản lý chung cư (1.1)",
              "Tổng quan yêu cầu chờ duyệt, sức chứa, doanh thu và cảnh báo",
@@ -349,7 +375,7 @@ class MainWindow(QMainWindow):
              "NGHIỆP VỤ QUẢN LÝ"),
             ("1.6_monitor", "1.6 Giám sát bãi 2D/3D", "Giám sát Bãi xe 2D & Sa bàn 3D (1.6)",
              "Theo dõi xe đang gửi, chỗ trống và tương tác sơ đồ 2D/3D",
-             ex.get("1.6_monitor") or self._build_placeholder("1.6 Giám sát bãi 2D/3D", "Theo dõi vị trí đang gửi xe và chỗ trống", "Minh"),
+             ex.get("1.6_monitor") or ManagerMonitorView(socket_client=self.socket_client, read_only=False),
              "GIÁM SÁT & THỐNG KÊ"),
             ("1.7_billing", "1.7 Theo dõi thu phí", "Theo dõi Thu phí & Công nợ (1.7)",
              "Phát hành hóa đơn tháng, đối soát phải thu và đã thu",
@@ -357,15 +383,15 @@ class MainWindow(QMainWindow):
              "GIÁM SÁT & THỐNG KÊ"),
             ("1.8_stats", "1.8 Thống kê & Doanh thu", "Thống kê Biểu đồ & Doanh thu (1.8)",
              "Phân tích lượt xe vào/ra, cư dân vs vãng lai và doanh thu",
-             ex.get("1.8_stats") or self._build_placeholder("1.8 Thống kê & Doanh thu", "Biểu đồ lượt vào/ra và doanh thu", "Minh"),
+             ex.get("1.8_stats") or ManagerStatsView(socket_client=self.socket_client, read_only=False),
              "GIÁM SÁT & THỐNG KÊ"),
             ("1.9_history", "1.9 Lịch sử vào / ra", "Tra cứu Lịch sử Xe Vào / Ra (1.9)",
              "Đối chiếu ảnh cổng vào/ra và lịch sử lượt gửi",
-             ex.get("1.9_history") or self._build_placeholder("1.9 Lịch sử vào / ra", "Tra cứu lượt xe vào/ra và ảnh đối chiếu", "Minh"),
+             ex.get("1.9_history") or ManagerHistoryView(socket_client=self.socket_client, read_only=False),
              "GIÁM SÁT & THỐNG KÊ"),
             ("1.10_notify", "1.10 Thông báo chung cư", "Phát Thông báo & Cảnh báo Khẩn (1.10)",
              "Soạn nháp, phát thông báo Push real-time và thử gửi lại",
-             ex.get("1.10_notify") or self._build_placeholder("1.10 Thông báo chung cư", "Soạn và phát thông báo Push khẩn cấp", "Minh"),
+             ex.get("1.10_notify") or ManagerNotifyView(socket_client=self.socket_client, read_only=False),
              "THÔNG BÁO KHẨN CẤP"),
         ]
         for key, nav, title, sub, widget, grp in specs:
@@ -373,6 +399,23 @@ class MainWindow(QMainWindow):
 
     def _populate_staff_pages(self) -> None:
         ex = self._extra_views
+        staff_notify_view = ex.get("2.7_notify") or StaffNotifyInboxView(socket_client=self.socket_client)
+        if hasattr(staff_notify_view, "unread_count_changed"):
+            staff_notify_view.unread_count_changed.connect(self.set_unread_count)
+        finance_ro = ex.get("4.7_finance_ro")
+        if finance_ro is None:
+            fin_tabs = QTabWidget()
+            fin_tabs.addTab(ManagerStatsView(socket_client=self.socket_client, read_only=True), "4.7.1–4.7.3 Thống kê & Doanh thu")
+            fin_tabs.addTab(FinanceView(socket_client=self.socket_client, read_only=True), "4.7.4 Thu phí & Công nợ")
+            finance_ro = fin_tabs
+
+        parking_ro = ex.get("4.8_parking_ro")
+        if parking_ro is None:
+            park_tabs = QTabWidget()
+            park_tabs.addTab(ManagerMonitorView(socket_client=self.socket_client, read_only=True), "4.8.1–4.8.2 Giám sát bãi 2D/3D")
+            park_tabs.addTab(ManagerHistoryView(socket_client=self.socket_client, read_only=True), "4.8.3 Lịch sử xe vào/ra")
+            parking_ro = park_tabs
+
         specs = [
             ("2.1_profile", "2.1 Hồ sơ & Mật khẩu", "Tài khoản Nhân viên (2.1)",
              "Xem thông tin nhân viên trực bãi và đổi mật khẩu",
@@ -396,11 +439,11 @@ class MainWindow(QMainWindow):
              "GIÁM SÁT & THÔNG BÁO"),
             ("2.6_monitor", "2.6 Giám sát bãi 2D/3D", "Giám sát Bãi xe 2D/3D (2.6)",
              "Theo dõi chỗ trống và trạng thái các ô đỗ theo thời gian thực",
-             ex.get("2.6_monitor") or self._build_placeholder("2.6 Giám sát bãi 2D/3D", "Sơ đồ bãi xe 2D Grid và Sa bàn 3D", "Minh"),
+             ex.get("2.6_monitor") or StaffMonitorView(socket_client=self.socket_client),
              "GIÁM SÁT & THÔNG BÁO"),
             ("2.7_notify", "2.7 Thông báo khẩn cấp", "Hộp thư Thông báo Nhân viên (2.7)",
              "Nhận cảnh báo khẩn cấp, đọc chi tiết và xác nhận tiếp nhận",
-             ex.get("2.7_notify") or self._build_placeholder("2.7 Thông báo khẩn cấp", "Hộp thư thông báo và xác nhận đã tiếp nhận", "Minh"),
+             staff_notify_view,
              "GIÁM SÁT & THÔNG BÁO"),
         ]
         for key, nav, title, sub, widget, grp in specs:
@@ -408,6 +451,10 @@ class MainWindow(QMainWindow):
 
     def _populate_resident_pages(self) -> None:
         ex = self._extra_views
+        res_notify_view = ex.get("3.6_notify") or ResidentNotifyView(socket_client=self.socket_client)
+        if hasattr(res_notify_view, "unread_count_changed"):
+            res_notify_view.unread_count_changed.connect(self.set_unread_count)
+
         specs = [
             ("3.1_profile", "3.1 Hồ sơ & Mật khẩu", "Hồ sơ Cư dân & Căn hộ (3.1)",
              "Quản lý thông tin liên hệ và bảo mật tài khoản",
@@ -431,7 +478,7 @@ class MainWindow(QMainWindow):
              "TÀI CHÍNH & THÔNG BÁO"),
             ("3.6_notify", "3.6 Hộp thư thông báo", "Thông báo từ Ban Quản Lý (3.6)",
              "Nhận cảnh báo khẩn cấp, kết quả duyệt hồ sơ và đánh dấu đã đọc",
-             ex.get("3.6_notify") or self._build_placeholder("3.6 Hộp thư thông báo", "Xem thông báo khẩn và đánh dấu đã đọc", "Minh"),
+             res_notify_view,
              "TÀI CHÍNH & THÔNG BÁO"),
         ]
         for key, nav, title, sub, widget, grp in specs:
@@ -439,7 +486,6 @@ class MainWindow(QMainWindow):
 
     def _populate_admin_pages(self) -> None:
         ex = self._extra_views
-        from PySide6.QtWidgets import QTabWidget
 
         infra_ro = ex.get("4.6_infra_ro")
         if infra_ro is None:
@@ -447,6 +493,20 @@ class MainWindow(QMainWindow):
             tabs.addTab(HRView(socket_client=self.socket_client, read_only=True), "4.6.1 Nhân sự & Cư dân")
             tabs.addTab(InfraPricingView(socket_client=self.socket_client, read_only=True), "4.6.3–4.6.4 Khu vực, Vị trí & Giá")
             infra_ro = tabs
+
+        finance_ro = ex.get("4.7_finance_ro")
+        if finance_ro is None:
+            fin_tabs = QTabWidget()
+            fin_tabs.addTab(ManagerStatsView(socket_client=self.socket_client, read_only=True), "4.7.1–4.7.3 Thống kê & Doanh thu")
+            fin_tabs.addTab(FinanceView(socket_client=self.socket_client, read_only=True), "4.7.4 Thu phí & Công nợ")
+            finance_ro = fin_tabs
+
+        parking_ro = ex.get("4.8_parking_ro")
+        if parking_ro is None:
+            park_tabs = QTabWidget()
+            park_tabs.addTab(ManagerMonitorView(socket_client=self.socket_client, read_only=True), "4.8.1–4.8.2 Giám sát bãi 2D/3D")
+            park_tabs.addTab(ManagerHistoryView(socket_client=self.socket_client, read_only=True), "4.8.3 Lịch sử xe vào/ra")
+            parking_ro = park_tabs
 
         specs = [
             ("4.1_profile", "4.1 Hồ sơ Admin", "Hồ sơ Quản trị Hệ thống (4.1)",
@@ -475,11 +535,11 @@ class MainWindow(QMainWindow):
              "BÁO CÁO READ-ONLY (4.5–4.8)"),
             ("4.7_finance_ro", "4.7 Thống kê & Phí (Chỉ xem)", "Thống kê & Thu phí — Chỉ Xem (4.7)",
              "Xem biểu đồ lượt xe, doanh thu và công nợ cư dân",
-             AdminReadOnlyWrapper("4.7 Thống kê & Phí (Chỉ xem)", ex.get("4.7_finance_ro") or FinanceView(socket_client=self.socket_client, read_only=True)),
+             AdminReadOnlyWrapper("4.7 Thống kê & Phí (Chỉ xem)", finance_ro),
              "BÁO CÁO READ-ONLY (4.5–4.8)"),
             ("4.8_parking_ro", "4.8 Bãi xe & Vào/Ra (Chỉ xem)", "Bãi xe & Lịch sử Vào/Ra — Chỉ Xem (4.8)",
              "Xem sơ đồ bãi xe 2D/3D và lịch sử xe vào/ra",
-             AdminReadOnlyWrapper("4.8 Bãi xe & Vào/Ra (Chỉ xem)", ex.get("4.8_parking_ro")),
+             AdminReadOnlyWrapper("4.8 Bãi xe & Vào/Ra (Chỉ xem)", parking_ro),
              "BÁO CÁO READ-ONLY (4.5–4.8)"),
         ]
         for key, nav, title, sub, widget, grp in specs:
@@ -621,16 +681,20 @@ class MainWindow(QMainWindow):
 
     def load_initial_data(self) -> None:
         """Nạp dữ liệu ban đầu cho trang đầu tiên và các module con hỗ trợ refresh_data."""
-        for key, page in self._pages.items():
-            if hasattr(page, "refresh_data"):
+        for page in self._pages.values():
+            target = page.child_widget if isinstance(page, AdminReadOnlyWrapper) else page
+            if target is None:
+                continue
+            if hasattr(target, "refresh_data"):
                 try:
-                    page.refresh_data()
+                    target.refresh_data()
                 except Exception:
                     pass
-            elif isinstance(page, AdminReadOnlyWrapper) and page.child_widget is not None:
-                if hasattr(page.child_widget, "refresh_data"):
-                    try:
-                        page.child_widget.refresh_data()
-                    except Exception:
-                        pass
-            _ = key
+            elif isinstance(target, QTabWidget):
+                for idx in range(target.count()):
+                    sub = target.widget(idx)
+                    if sub is not None and hasattr(sub, "refresh_data"):
+                        try:
+                            sub.refresh_data()
+                        except Exception:
+                            pass

@@ -15,6 +15,11 @@ from client.ui.manager.dashboard_view import DashboardView
 from client.ui.manager.finance_view import FinanceView
 from client.ui.manager.hr_view import HRView
 from client.ui.manager.infra_pricing_view import InfraPricingView
+from client.ui.manager.stats_history_view import (
+    ManagerHistoryView,
+    ManagerMonitorView,
+    ManagerStatsView,
+)
 from client.ui.theme.role_shell import RolePortalWindow
 
 
@@ -89,10 +94,26 @@ class AdminWindow(RolePortalWindow):
             self.ro_infra_pricing_view = None
 
         if "4.7_finance_ro" not in custom_ro:
+            fin_tabs = QTabWidget()
+            self.ro_stats_view = ManagerStatsView(socket_client=socket_client, read_only=True)
             self.ro_finance_view = FinanceView(socket_client=socket_client, read_only=True)
-            custom_ro["4.7_finance_ro"] = self.ro_finance_view
+            fin_tabs.addTab(self.ro_stats_view, "4.7.1–4.7.3 Thống kê & Doanh thu")
+            fin_tabs.addTab(self.ro_finance_view, "4.7.4 Thu phí & Công nợ")
+            custom_ro["4.7_finance_ro"] = fin_tabs
         else:
+            self.ro_stats_view = None
             self.ro_finance_view = None
+
+        if "4.8_parking_ro" not in custom_ro:
+            park_tabs = QTabWidget()
+            self.ro_monitor_view = ManagerMonitorView(socket_client=socket_client, read_only=True)
+            self.ro_history_view = ManagerHistoryView(socket_client=socket_client, read_only=True)
+            park_tabs.addTab(self.ro_monitor_view, "4.8.1–4.8.2 Giám sát bãi 2D/3D")
+            park_tabs.addTab(self.ro_history_view, "4.8.3 Lịch sử xe vào/ra")
+            custom_ro["4.8_parking_ro"] = park_tabs
+        else:
+            self.ro_monitor_view = None
+            self.ro_history_view = None
 
         readonly_sections = (
             ("4.6_infra_ro", "4.6 Hạ tầng & Giá (Chỉ xem)", "Xem khu vực đỗ, vị trí đỗ, xe cư dân và bảng giá"),
@@ -122,6 +143,13 @@ class AdminWindow(RolePortalWindow):
         self.logs_view.refresh_log_type("error")
         if isinstance(self.dashboard_readonly_view.child_widget, DashboardView):
             self.dashboard_readonly_view.child_widget.refresh_data()
-        for ro_view in (self.ro_hr_view, self.ro_infra_pricing_view, self.ro_finance_view):
+        for ro_view in (
+            self.ro_hr_view,
+            self.ro_infra_pricing_view,
+            self.ro_stats_view,
+            self.ro_finance_view,
+            self.ro_monitor_view,
+            self.ro_history_view,
+        ):
             if ro_view is not None and hasattr(ro_view, "refresh_data"):
                 ro_view.refresh_data()
