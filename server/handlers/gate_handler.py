@@ -1334,3 +1334,220 @@ class GateHandler:
                 else f"Đã mở cổng ra cho xe cư dân {exit_record['bien_so_xe']} (Miễn phí lượt)."
             ),
         }
+
+    # ==========================================================================
+    # NHÓM 2.4: QUẢN LÝ CA LÀM VIỆC, DOANH THU THEO CA & CHỐT CA
+    # ==========================================================================
+    def _collect_shift_metrics(
+        self, db_or_tx: Any, shift_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tổng hợp KPI và danh sách giao dịch thu phí của một ca làm việc."""
+        shift_id = str(shift_info.get("ma_ca_lam_viec") or "")
+        staff_id = int(shift_info.get("ma_nhan_vien") or 0)
+        shift_date = str(shift_info.get("ngay_ghi_nhan") or datetime.now().date().isoformat())[:10]
+        ca_code = str(shift_info.get("ca_lam_viec") or "")
+
+        raw_logs = self.file_logger.query_logs(
+            "parking_history",
+            start_date=shift_date,
+            end_date=shift_date,
+            limit=0,
+        )
+
+        transactions: List[Dict[str, Any]] = []
+        cash_total = 0.0
+        qr_total = 0.0
+        oto_vl = 0
+        xemay_vl = 0
+        cu_dan_turns = 0
+
+        for rec in raw_logs:
+            if rec.get("trang_thai") != ParkingHistoryStatus.DA_RA_BAI.value:
+                continue
+            rec_shift_id = str(rec.get("ma_ca_lam_viec") or "")
+            if rec_shift_id:
+                if rec_shift_id != shift_id:
+                    continue
+            else:
+                if int(rec.get("ma_nhan_vien_ra") or 0) != staff_id or str(rec.get("ca_lam_viec") or "") != ca_code:
+                    continue
+
+            loai_khach = str(rec.get("loai_khach") or "")
+            ma_loai_xe = str(rec.get("ma_loai_xe") or VehicleTypes.O_TO.value)
+            tien_thu = float(rec.get("tien_thu") or 0)
+            method = str(rec.get("phuong_thuc_thanh_toan") or PaymentMethods.TIEN_MAT.value)
+
+            if loai_khach == "cu_dan":
+                cu_dan_turns += 1
+                continue
+
+            if ma_loai_xe == VehicleTypes.O_TO.value:
+                oto_vl += 1
+            else:
+                xemay_vl += 1
+
+            if method == PaymentMethods.CHUYEN_KHOAN_QR.value:
+                qr_total += tien_thu
+            else:
+                cash_total += tien_thu
+
+            transactions.append(
+                {
+                    "ma_luot_gui": rec.get("ma_luot_gui") or "",
+                    "ma_tham_chieu": rec.get("ma_tham_chieu") or rec.get("ma_luot_gui") or "",
+                    "thoi_gian_vao": rec.get("thoi_gian_vao") or "",
+                    "thoi_gian_ra": rec.get("thoi_gian_ra") or rec.get("timestamp") or "",
+                    "bien_so_xe": rec.get("bien_so_xe") or "",
+                    "ma_loai_xe": ma_loai_xe,
+                    "ma_khu_vuc": rec.get("ma_khu_vuc") or "",
+                    "ma_vi_tri": rec.get("ma_vi_tri") or "",
+                    "phuong_thuc_thanh_toan": method,
+                    "tien_thu": tien_thu,
+                    "cong_thuc_text": rec.get("cong_thuc_text") or "",
+                }
+            )
+
+        report_rows = db_or_tx.fetch_all(
+            """
+            SELECT ma_khu_vuc, so_luot_oto_vang_lai, so_luot_xemay_vang_lai,
+                   so_luot_xe_cu_dan, tong_tien_thu_vang_lai
+            FROM bao_cao_luot_va_thu_phi
+            WHERE ma_nhan_vien = %s
+              AND ngay_ghi_nhan = %s
+              AND ca_lam_viec = %s
+            ORDER BY ma_khu_vuc ASC
+            """,
+            (staff_id, shift_date, ca_code),
+        )
+        db_total_money = sum(float(r.get("tong_tien_thu_vang_lai") or 0) for r in report_rows)
+        log_total_money = cash_total + qr_total
+        # Nếu ca đã chốt có snapshot cố định thì ưu tiên snapshot/log của riêng ca đó
+        if shift_info.get("trang_thai_ca") == "da_dong" and shift_info.get("tong_doanh_thu_chot_ca") is not None:
+            tong_doanh_thu = max(log_total_money, float(shift_info.get("tong_doanh_thu_chot_ca") or 0))
+        else:
+            tong_doanh_thu = log_total_money if transactions else max(log_total_money, db_total_money)
+
+        return {
+            "kpi": {
+                "tong_doanh_thu": round(tong_doanh_thu, 2),
+                "doanh_thu_tien_mat": round(cash_total, 2),
+                "doanh_thu_qr": round(qr_total, 2),
+                "so_luot_thu_phi": len(transactions),
+                "so_luot_oto_vang_lai": oto_vl,
+                "so_luot_xemay_vang_lai": xemay_vl,
+                "so_luot_xe_cu_dan": cu_dan_turns,
+            },
+            "transactions": transactions,
+            "zone_reports": report_rows,
+        }
+
+    def handle_shift_get_revenue(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.4: Lấy thông tin ca trực hiện tại, KPI doanh thu, chi tiết giao dịch & lịch sử ca."""
+        self._ensure_staff_role(session)
+        db = self._db()
+        current_shift = self._ensure_open_shift(db, session)
+        staff_id = int(current_shift["ma_nhan_vien"])
+
+        requested_shift_id = str(payload.get("ma_ca_lam_viec") or "").strip()
+        all_shifts = [
+            s for s in self._load_shift_sessions()
+            if int(s.get("ma_nhan_vien") or 0) == staff_id
+        ]
+
+        selected_shift = current_shift
+        if requested_shift_id:
+            for s in all_shifts:
+                if str(s.get("ma_ca_lam_viec") or "") == requested_shift_id:
+                    selected_shift = dict(s)
+                    break
+
+        metrics = self._collect_shift_metrics(db, selected_shift)
+
+        shift_history: List[Dict[str, Any]] = []
+        for s in all_shifts[:20]:
+            s_copy = dict(s)
+            if str(s_copy.get("ma_ca_lam_viec") or "") == str(selected_shift.get("ma_ca_lam_viec") or ""):
+                s_copy.setdefault("tong_doanh_thu_chot_ca", metrics["kpi"]["tong_doanh_thu"])
+                s_copy.setdefault("so_luot_thu_phi", metrics["kpi"]["so_luot_thu_phi"])
+            elif s_copy.get("tong_doanh_thu_chot_ca") is None:
+                m = self._collect_shift_metrics(db, s_copy)
+                s_copy["tong_doanh_thu_chot_ca"] = m["kpi"]["tong_doanh_thu"]
+                s_copy["so_luot_thu_phi"] = m["kpi"]["so_luot_thu_phi"]
+            shift_history.append(s_copy)
+
+        return {
+            "current_shift": current_shift,
+            "selected_shift": selected_shift,
+            "kpi": metrics["kpi"],
+            "transactions": metrics["transactions"],
+            "zone_reports": metrics["zone_reports"],
+            "shift_history": shift_history,
+        }
+
+    def handle_shift_close(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.4: Chốt ca làm việc đang mở của nhân viên và ghi nhận tổng kết bàn giao."""
+        self._ensure_staff_role(session)
+        db = self._db()
+        staff = self._resolve_staff_profile(db, session)
+        staff_id = int(staff["ma_nhan_vien"])
+        requested_shift_id = str(payload.get("ma_ca_lam_viec") or "").strip()
+        ghi_chu = str(payload.get("ghi_chu") or "").strip()
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        with self._shift_lock:
+            shifts = self._load_shift_sessions()
+            target_idx: Optional[int] = None
+            for idx, item in enumerate(shifts):
+                if int(item.get("ma_nhan_vien") or 0) != staff_id:
+                    continue
+                if requested_shift_id and str(item.get("ma_ca_lam_viec") or "") != requested_shift_id:
+                    continue
+                if item.get("trang_thai_ca") == "dang_mo":
+                    target_idx = idx
+                    break
+
+            if target_idx is None:
+                raise BusinessError("Hiện không có ca trực nào đang mở để chốt ca.")
+
+            target_shift = dict(shifts[target_idx])
+            metrics = self._collect_shift_metrics(db, target_shift)
+            kpi = metrics["kpi"]
+
+            target_shift["trang_thai_ca"] = "da_dong"
+            target_shift["gio_ket_thuc"] = now_iso
+            target_shift["tong_doanh_thu_chot_ca"] = kpi["tong_doanh_thu"]
+            target_shift["doanh_thu_tien_mat"] = kpi["doanh_thu_tien_mat"]
+            target_shift["doanh_thu_qr"] = kpi["doanh_thu_qr"]
+            target_shift["so_luot_thu_phi"] = kpi["so_luot_thu_phi"]
+            target_shift["so_luot_xe_cu_dan"] = kpi["so_luot_xe_cu_dan"]
+            target_shift["ghi_chu_ban_giao"] = ghi_chu
+            shifts[target_idx] = target_shift
+            self._save_shift_sessions(shifts)
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="SHIFT_CLOSE",
+            doi_tuong="ca_lam_viec",
+            ma_doi_tuong=target_shift["ma_ca_lam_viec"],
+            gia_tri_moi={
+                "tong_doanh_thu_chot_ca": target_shift["tong_doanh_thu_chot_ca"],
+                "doanh_thu_tien_mat": target_shift["doanh_thu_tien_mat"],
+                "doanh_thu_qr": target_shift["doanh_thu_qr"],
+                "so_luot_thu_phi": target_shift["so_luot_thu_phi"],
+            },
+        )
+
+        return {
+            "closed_shift": target_shift,
+            "kpi": kpi,
+            "message": (
+                f"Đã chốt {target_shift['ten_ca']} ({target_shift['ma_ca_lam_viec']}). "
+                f"Tổng bàn giao: {int(target_shift['tong_doanh_thu_chot_ca']):,} VNĐ."
+            ),
+        }
