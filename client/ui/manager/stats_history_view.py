@@ -5,11 +5,13 @@
 - ManagerNotifyView (1.10): Soạn nháp, phát thông báo Push khẩn cấp & theo dõi/Retry
 """
 
+import base64
 from typing import Any, Dict, List, Optional
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -706,3 +708,244 @@ class ManagerStatsView(QWidget):
         ax3.grid(axis="y", linestyle="--", alpha=0.35)
         self.fig_revenue.tight_layout()
         self.canvas_revenue.draw()
+
+
+def _pixmap_from_b64(b64_text: str) -> Optional[QPixmap]:
+    if not b64_text:
+        return None
+    raw = str(b64_text).strip()
+    if raw.startswith("data:image/") and "," in raw:
+        raw = raw.split(",", 1)[1]
+    try:
+        data = base64.b64decode(raw)
+        pix = QPixmap()
+        if pix.loadFromData(data):
+            return pix
+    except Exception:
+        return None
+    return None
+
+
+class HistoryDetailDialog(QDialog):
+    """Hộp thoại 1.9.3: Xem chi tiết lượt gửi kèm 2 ảnh đối chiếu cổng vào & cổng ra."""
+
+    def __init__(self, session_data: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        code = str(session_data.get("ma_luot_gui") or "-")
+        self.setWindowTitle(f"Chi tiết Lượt gửi {code} (1.9.3)")
+        self.setMinimumSize(720, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        top_card = SectionCard(
+            title=f"Lượt gửi: {code}",
+            subtitle=f"Trạng thái: {session_data.get('trang_thai') or '-'}",
+        )
+        plate = str(session_data.get("bien_so_xe") or "---")
+        top_card.add_header_widget(PlateBadge(plate))
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        nv_vao = session_data.get("ten_nhan_vien_vao") or session_data.get("ma_nhan_vien_vao") or "-"
+        nv_ra = session_data.get("ten_nhan_vien_ra") or session_data.get("ma_nhan_vien_ra") or "-"
+        for label, val in (
+            ("Loại khách / Loại xe:", f"{session_data.get('loai_khach') or '-'} · {session_data.get('ma_loai_xe') or '-'}"),
+            ("Khu vực / Vị trí:", f"{session_data.get('ma_khu_vuc') or '-'} / {session_data.get('ma_vi_tri') or '-'}"),
+            ("Thời gian vào:", session_data.get("thoi_gian_vao") or "-"),
+            ("Thời gian ra:", session_data.get("thoi_gian_ra") or "Chưa ra bãi"),
+            ("Nhân viên vào / ra:", f"{nv_vao} / {nv_ra}"),
+            ("Phí thu:", _fmt_vnd(session_data.get("tien_thu"))),
+        ):
+            form.addRow(label, QLabel(str(val)))
+        top_card.body_layout.addLayout(form)
+        root.addWidget(top_card)
+
+        # Khung 2 ảnh đối chiếu cổng vào & cổng ra
+        imgs_row = QHBoxLayout()
+        imgs_row.setSpacing(12)
+        for title, b64_key in (("Ảnh cổng VÀO", "anh_vao"), ("Ảnh cổng RA", "anh_ra")):
+            img_card = SectionCard(title=title)
+            lbl_img = QLabel("Chưa có ảnh ghi nhận")
+            lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_img.setMinimumSize(280, 190)
+            lbl_img.setStyleSheet(
+                f"background-color: {Colors.BG_ELEVATED}; border: 1px dashed {Colors.BORDER_INPUT}; "
+                f"border-radius: 8px; color: {Colors.TEXT_MUTED};"
+            )
+            pix = _pixmap_from_b64(str(session_data.get(b64_key) or ""))
+            if pix is not None:
+                lbl_img.setPixmap(
+                    pix.scaled(
+                        300,
+                        200,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            img_card.body_layout.addWidget(lbl_img)
+            imgs_row.addWidget(img_card, 1)
+        root.addLayout(imgs_row, 1)
+
+        btn_close = QPushButton("Đóng")
+        set_button_variant(btn_close, "default", "sm")
+        btn_close.clicked.connect(self.accept)
+        root.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignRight)
+
+
+class ManagerHistoryView(QWidget):
+    """Màn hình 1.9 (Quản lý) & 4.8 (Admin Read-Only): Tra cứu lịch sử xe vào/ra."""
+
+    def __init__(
+        self,
+        socket_client: Optional[SocketClient] = None,
+        read_only: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.socket_client = socket_client
+        self.read_only = read_only
+        self._items: List[Dict[str, Any]] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        if self.read_only:
+            root.addWidget(ReadOnlyBanner(self))
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        lbl_title = QLabel("Tra cứu Lịch sử Xe Vào / Ra (1.9)")
+        lbl_title.setStyleSheet(
+            f"font-family: {Fonts.HEADING_FAMILY}; font-size: 21px; font-weight: 700; color: {Colors.TEXT_PRIMARY};"
+        )
+        self.lbl_sub = QLabel("Truy xuất nhật ký parking_history_*.jsonl kèm ảnh đối chiếu vào/ra")
+        self.lbl_sub.setStyleSheet(f"font-size: 12.5px; color: {Colors.TEXT_MUTED};")
+        title_col.addWidget(lbl_title)
+        title_col.addWidget(self.lbl_sub)
+        header.addLayout(title_col, 1)
+
+        self.btn_detail = QPushButton("Xem chi tiết & Ảnh (1.9.3)")
+        set_button_variant(self.btn_detail, "primary", "sm")
+        self.btn_detail.clicked.connect(self._open_selected_detail)
+        header.addWidget(self.btn_detail)
+
+        self.btn_refresh = QPushButton("Tra cứu")
+        set_button_variant(self.btn_refresh, "teal", "sm")
+        self.btn_refresh.clicked.connect(self.refresh_data)
+        header.addWidget(self.btn_refresh)
+        root.addLayout(header)
+
+        # Bộ lọc
+        filter_card = SectionCard(title="Bộ lọc lịch sử vào / ra")
+        f_row = QHBoxLayout()
+        f_row.setSpacing(10)
+
+        self.cbo_mode = QComboBox()
+        self.cbo_mode.addItem("1.9.1 Lịch sử xe vào", "entries")
+        self.cbo_mode.addItem("1.9.2 Lịch sử xe ra", "exits")
+        self.cbo_mode.currentIndexChanged.connect(self.refresh_data)
+
+        self.txt_plate = QLineEdit()
+        self.txt_plate.setPlaceholderText("Biển số xe (VD: 51H-888.99)...")
+        self.txt_plate.returnPressed.connect(self.refresh_data)
+
+        self.cbo_guest = QComboBox()
+        self.cbo_guest.addItem("Tất cả khách", "")
+        self.cbo_guest.addItem("Cư dân", "cu_dan")
+        self.cbo_guest.addItem("Vãng lai", "vang_lai")
+
+        today = QDate.currentDate()
+        self.dt_start = QDateEdit(today.addDays(-30))
+        self.dt_start.setCalendarPopup(True)
+        self.dt_start.setDisplayFormat("yyyy-MM-dd")
+        self.dt_end = QDateEdit(today)
+        self.dt_end.setCalendarPopup(True)
+        self.dt_end.setDisplayFormat("yyyy-MM-dd")
+
+        f_row.addWidget(self.cbo_mode)
+        f_row.addWidget(self.txt_plate, 1)
+        f_row.addWidget(self.cbo_guest)
+        f_row.addWidget(QLabel("Từ:"))
+        f_row.addWidget(self.dt_start)
+        f_row.addWidget(QLabel("Đến:"))
+        f_row.addWidget(self.dt_end)
+        filter_card.body_layout.addLayout(f_row)
+        root.addWidget(filter_card)
+
+        list_card = SectionCard(
+            title="Kết quả tra cứu lượt gửi",
+            subtitle="Nhấp đúp vào một dòng để mở chi tiết & ảnh đối chiếu vào/ra",
+        )
+        self.tbl_history = QTableWidget(0, 8)
+        self.tbl_history.setHorizontalHeaderLabels(
+            ["Mã lượt", "Biển số", "Loại khách", "Loại xe", "Khu vực / Ô", "Giờ vào", "Giờ ra / Tiền thu", "Trạng thái"]
+        )
+        style_table(self.tbl_history)
+        self.tbl_history.doubleClicked.connect(lambda _idx: self._open_selected_detail())
+        list_card.body_layout.addWidget(self.tbl_history, 1)
+        root.addWidget(list_card, 1)
+
+    def refresh_data(self) -> None:
+        if self.socket_client is None or not self.socket_client.is_connected():
+            self.lbl_sub.setText("Chưa kết nối Server — không thể tải lịch sử.")
+            return
+
+        mode = str(self.cbo_mode.currentData() or "entries")
+        action = Actions.HISTORY_EXITS if mode == "exits" else Actions.HISTORY_ENTRIES
+        payload = {
+            "bien_so_xe": self.txt_plate.text().strip(),
+            "loai_khach": str(self.cbo_guest.currentData() or ""),
+            "start_date": self.dt_start.date().toString("yyyy-MM-dd"),
+            "end_date": self.dt_end.date().toString("yyyy-MM-dd"),
+            "limit": 200,
+        }
+        resp = self.socket_client.call(action, payload)
+        if not resp.get("ok"):
+            self.lbl_sub.setText(f"Lỗi tải lịch sử: {resp.get('error')}")
+            return
+        data = resp.get("data") or {}
+        self.apply_history_items(data.get("items") or [], mode=mode)
+
+    def apply_history_items(self, items: List[Dict[str, Any]], mode: str = "entries") -> None:
+        self._items = list(items)
+        self.lbl_sub.setText(f"Tìm thấy {len(self._items)} lượt gửi ({'Xe ra' if mode == 'exits' else 'Xe vào'})")
+        self.tbl_history.setRowCount(len(self._items))
+        for i, row in enumerate(self._items):
+            st = str(row.get("trang_thai") or "dang_gui")
+            col6 = (
+                f"{row.get('thoi_gian_ra') or '-'} · {_fmt_vnd(row.get('tien_thu'))}"
+                if mode == "exits" or row.get("thoi_gian_ra")
+                else "-"
+            )
+            self.tbl_history.setItem(i, 0, QTableWidgetItem(str(row.get("ma_luot_gui") or "")))
+            self.tbl_history.setItem(i, 1, QTableWidgetItem(str(row.get("bien_so_xe") or "")))
+            self.tbl_history.setItem(i, 2, QTableWidgetItem("Cư dân" if row.get("loai_khach") == "cu_dan" else "Vãng lai"))
+            self.tbl_history.setItem(i, 3, QTableWidgetItem(str(row.get("ma_loai_xe") or "")))
+            self.tbl_history.setItem(i, 4, QTableWidgetItem(f"{row.get('ma_khu_vuc') or '-'} / {row.get('ma_vi_tri') or '-'}"))
+            self.tbl_history.setItem(i, 5, QTableWidgetItem(str(row.get("thoi_gian_vao") or "")))
+            self.tbl_history.setItem(i, 6, QTableWidgetItem(col6))
+            self.tbl_history.setCellWidget(
+                i, 7, StatusBadge("Đã ra bãi" if st == "da_ra_bai" else "Đang gửi", "success" if st == "da_ra_bai" else "info")
+            )
+
+    def _open_selected_detail(self) -> None:
+        row_idx = self.tbl_history.currentRow()
+        if row_idx < 0 or row_idx >= len(self._items):
+            return
+        selected = self._items[row_idx]
+        detail = dict(selected)
+        if self.socket_client is not None and self.socket_client.is_connected():
+            resp = self.socket_client.call(
+                Actions.HISTORY_SESSION_DETAIL,
+                {"ma_luot_gui": selected.get("ma_luot_gui")},
+            )
+            if resp.get("ok"):
+                detail = (resp.get("data") or {}).get("session") or detail
+        dlg = HistoryDetailDialog(detail, parent=self)
+        dlg.exec()
