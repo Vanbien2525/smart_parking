@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -40,12 +41,18 @@ from client.ui.theme.components import (
     SectionCard,
     StatCard,
     StatusBadge,
+    ToastNotification,
     set_button_variant,
     style_table,
 )
 from client.ui.theme.parking_3d_widget import Parking3DSceneWidget
 from client.ui.theme.tokens import Colors, Fonts, SLOT_STATE_STYLES
-from shared.constants import SlotStatus
+from shared.constants import (
+    NotifyLevels,
+    NotifyRecipientGroups,
+    NotifyTypes,
+    SlotStatus,
+)
 from shared.protocol import Actions
 
 
@@ -949,3 +956,346 @@ class ManagerHistoryView(QWidget):
                 detail = (resp.get("data") or {}).get("session") or detail
         dlg = HistoryDetailDialog(detail, parent=self)
         dlg.exec()
+
+
+_EMERGENCY_PRESETS = {
+    "chay": (
+        "KHẨN CẤP: Cảnh báo cháy nổ tầng hầm",
+        "Phát hiện cảnh báo khói/cháy tại khu vực hầm giữ xe. Đề nghị toàn bộ cư dân và nhân viên sơ tán theo lối thoát hiểm ngay lập tức!",
+        NotifyTypes.KHAN_CAP.value,
+        NotifyLevels.KHAN_CAP.value,
+    ),
+    "thien_tai": (
+        "KHẨN CẤP: Cảnh báo mưa bão / ngập hầm",
+        "Dự báo mưa lớn có nguy cơ ngập nước. Đề nghị chủ xe tại Hầm B1 nhanh chóng di chuyển phương tiện lên khu vực cao ráo.",
+        NotifyTypes.KHAN_CAP.value,
+        NotifyLevels.KHAN_CAP.value,
+    ),
+    "mat_dien": (
+        "KHẨN CẤP: Sự cố mất điện toàn khu bãi xe",
+        "Hệ thống điện lưới khu vực bãi giữ xe đang gặp sự cố, barie chuyển sang chế độ vận hành dự phòng. Nhân viên trực cổng hỗ trợ kiểm soát thủ công.",
+        NotifyTypes.KHAN_CAP.value,
+        NotifyLevels.KHAN_CAP.value,
+    ),
+    "bao_tri": (
+        "Thông báo bảo trì định kỳ hệ thống bãi xe",
+        "Ban Quản lý tiến hành bảo trì camera cổng vào/ra và sơn kẻ lại vạch ô đỗ từ 09:00 đến 11:30. Mong quý cư dân thông cảm.",
+        NotifyTypes.BAO_TRI_KY_THUAT.value,
+        NotifyLevels.QUAN_TRONG.value,
+    ),
+}
+
+
+class ManagerNotifyView(QWidget):
+    """Màn hình 1.10 Quản lý Thông báo & Cảnh báo Khẩn cấp (Workflow 01)."""
+
+    def __init__(
+        self,
+        socket_client: Optional[SocketClient] = None,
+        read_only: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.socket_client = socket_client
+        self.read_only = read_only
+        self._draft_id: Optional[str] = None
+        self._sent_items: List[Dict[str, Any]] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        if self.read_only:
+            root.addWidget(ReadOnlyBanner(self))
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        lbl_title = QLabel("Quản lý Thông báo & Cảnh báo Khẩn cấp (1.10)")
+        lbl_title.setStyleSheet(
+            f"font-family: {Fonts.HEADING_FAMILY}; font-size: 21px; font-weight: 700; color: {Colors.TEXT_PRIMARY};"
+        )
+        self.lbl_sub = QLabel("Soạn nháp, phát thông báo Push real-time và theo dõi ACK / Retry")
+        self.lbl_sub.setStyleSheet(f"font-size: 12.5px; color: {Colors.TEXT_MUTED};")
+        title_col.addWidget(lbl_title)
+        title_col.addWidget(self.lbl_sub)
+        header.addLayout(title_col, 1)
+
+        self.btn_refresh = QPushButton("Làm mới danh sách")
+        set_button_variant(self.btn_refresh, "default", "sm")
+        self.btn_refresh.clicked.connect(self.refresh_data)
+        header.addWidget(self.btn_refresh)
+        root.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(12)
+
+        # Cột trái: 1.10.1 Soạn & 1.10.2 Phát thông báo
+        compose_card = SectionCard(
+            title="1.10.1 – 1.10.2 Soạn & Phát thông báo",
+            subtitle="Chọn mẫu nhanh sự cố hoặc soạn nội dung tùy chỉnh",
+        )
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+        for key, label in (
+            ("chay", "Cháy"),
+            ("thien_tai", "Thiên tai"),
+            ("mat_dien", "Mất điện"),
+            ("bao_tri", "Bảo trì"),
+        ):
+            btn_p = QPushButton(label)
+            set_button_variant(btn_p, "danger" if key != "bao_tri" else "default", "sm")
+            btn_p.clicked.connect(lambda _c=False, k=key: self.apply_preset(k))
+            btn_p.setEnabled(not self.read_only)
+            preset_row.addWidget(btn_p)
+        preset_row.addStretch(1)
+        compose_card.body_layout.addLayout(preset_row)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.txt_title = QLineEdit()
+        self.txt_title.setPlaceholderText("Nhập tiêu đề thông báo...")
+        self.txt_content = QTextEdit()
+        self.txt_content.setPlaceholderText("Nhập nội dung thông báo chi tiết...")
+        self.txt_content.setMinimumHeight(96)
+
+        self.cbo_type = QComboBox()
+        self.cbo_type.addItem("Khẩn cấp (khan_cap)", NotifyTypes.KHAN_CAP.value)
+        self.cbo_type.addItem("Bảo trì kỹ thuật", NotifyTypes.BAO_TRI_KY_THUAT.value)
+        self.cbo_type.addItem("Kết quả duyệt hồ sơ", NotifyTypes.KET_QUA_DUYET_HO_SO.value)
+
+        self.cbo_level = QComboBox()
+        self.cbo_level.addItem("Khẩn cấp (khan_cap)", NotifyLevels.KHAN_CAP.value)
+        self.cbo_level.addItem("Quan trọng", NotifyLevels.QUAN_TRONG.value)
+        self.cbo_level.addItem("Bình thường", NotifyLevels.BINH_THUONG.value)
+
+        self.cbo_group = QComboBox()
+        self.cbo_group.addItem("Tất cả (Cư dân & Nhân viên)", NotifyRecipientGroups.TAT_CA.value)
+        self.cbo_group.addItem("Chỉ Cư dân", NotifyRecipientGroups.CU_DAN.value)
+        self.cbo_group.addItem("Chỉ Nhân viên", NotifyRecipientGroups.NHAN_VIEN.value)
+        self.cbo_group.addItem("Cá nhân (theo mã tài khoản)", NotifyRecipientGroups.CA_NHAN.value)
+        self.cbo_group.currentIndexChanged.connect(self._on_group_changed)
+
+        self.txt_target_id = QLineEdit()
+        self.txt_target_id.setPlaceholderText("Mã tài khoản cá nhân (VD: 4)")
+        self.txt_target_id.setEnabled(False)
+
+        form.addRow("Tiêu đề:", self.txt_title)
+        form.addRow("Loại thông báo:", self.cbo_type)
+        form.addRow("Mức độ:", self.cbo_level)
+        form.addRow("Nhóm người nhận:", self.cbo_group)
+        form.addRow("Mã TK cá nhân:", self.txt_target_id)
+        form.addRow("Nội dung:", self.txt_content)
+        compose_card.body_layout.addLayout(form)
+
+        self.lbl_draft_status = QLabel("Chưa lưu nháp")
+        self.lbl_draft_status.setStyleSheet(f"font-size: 12px; color: {Colors.TEXT_MUTED};")
+        compose_card.body_layout.addWidget(self.lbl_draft_status)
+
+        btn_row = QHBoxLayout()
+        self.btn_save_draft = QPushButton("Lưu nháp (1.10.1)")
+        set_button_variant(self.btn_save_draft, "default", "md")
+        self.btn_save_draft.clicked.connect(self._on_save_draft)
+
+        self.btn_publish = QPushButton("Gửi thông báo (1.10.2)")
+        set_button_variant(self.btn_publish, "danger", "md")
+        self.btn_publish.clicked.connect(self._on_publish)
+
+        btn_row.addWidget(self.btn_save_draft)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_publish)
+        compose_card.body_layout.addLayout(btn_row)
+
+        if self.read_only:
+            for w in (self.txt_title, self.txt_content, self.cbo_type, self.cbo_level, self.cbo_group, self.txt_target_id):
+                w.setEnabled(False)
+            self.btn_save_draft.setVisible(False)
+            self.btn_publish.setVisible(False)
+
+        splitter.addWidget(compose_card)
+
+        # Cột phải: 1.10.3 Lịch sử thông báo đã gửi & chi tiết tiếp nhận / Retry
+        right_col = QWidget()
+        r_lay = QVBoxLayout(right_col)
+        r_lay.setContentsMargins(0, 0, 0, 0)
+        r_lay.setSpacing(10)
+
+        sent_card = SectionCard(
+            title="1.10.3 Thông báo đã gửi & Trạng thái tiếp nhận",
+            subtitle="Chọn một thông báo để xem chi tiết từng người nhận hoặc bấm Thử gửi lại",
+        )
+        self.btn_retry = QPushButton("Thử gửi lại (Retry)")
+        set_button_variant(self.btn_retry, "primary", "sm")
+        self.btn_retry.clicked.connect(self._on_retry_selected)
+        if self.read_only:
+            self.btn_retry.setVisible(False)
+        else:
+            sent_card.add_header_widget(self.btn_retry)
+
+        self.tbl_sent = QTableWidget(0, 7)
+        self.tbl_sent.setHorizontalHeaderLabels(
+            ["Mã", "Tiêu đề", "Loại / Mức độ", "Nhóm nhận", "Gửi OK / Lỗi", "Đã tiếp nhận / Đọc", "Thời gian gửi"]
+        )
+        style_table(self.tbl_sent)
+        self.tbl_sent.itemSelectionChanged.connect(self._on_sent_selected)
+        sent_card.body_layout.addWidget(self.tbl_sent, 1)
+        r_lay.addWidget(sent_card, 3)
+
+        rec_card = SectionCard(title="Chi tiết người nhận thông báo đang chọn")
+        self.tbl_recipients = QTableWidget(0, 6)
+        self.tbl_recipients.setHorizontalHeaderLabels(
+            ["Tài khoản", "Họ tên", "Vai trò", "Trạng thái gửi", "Lần gửi lại", "Tiếp nhận / Đọc"]
+        )
+        style_table(self.tbl_recipients)
+        rec_card.body_layout.addWidget(self.tbl_recipients, 1)
+        r_lay.addWidget(rec_card, 2)
+
+        splitter.addWidget(right_col)
+        splitter.setSizes([440, 620])
+        root.addWidget(splitter, 1)
+
+    def _on_group_changed(self) -> None:
+        is_personal = self.cbo_group.currentData() == NotifyRecipientGroups.CA_NHAN.value
+        self.txt_target_id.setEnabled(is_personal and not self.read_only)
+
+    def apply_preset(self, preset_key: str) -> None:
+        preset = _EMERGENCY_PRESETS.get(preset_key)
+        if not preset:
+            return
+        title, content, loai, muc_do = preset
+        self.txt_title.setText(title)
+        self.txt_content.setPlainText(content)
+        idx_t = self.cbo_type.findData(loai)
+        if idx_t >= 0:
+            self.cbo_type.setCurrentIndex(idx_t)
+        idx_l = self.cbo_level.findData(muc_do)
+        if idx_l >= 0:
+            self.cbo_level.setCurrentIndex(idx_l)
+
+    def _collect_form_payload(self) -> Dict[str, Any]:
+        return {
+            "draft_id": self._draft_id,
+            "tieu_de": self.txt_title.text().strip(),
+            "noi_dung": self.txt_content.toPlainText().strip(),
+            "loai_thong_bao": str(self.cbo_type.currentData() or NotifyTypes.KHAN_CAP.value),
+            "muc_do": str(self.cbo_level.currentData() or NotifyLevels.KHAN_CAP.value),
+            "nhom_nguoi_nhan": str(self.cbo_group.currentData() or NotifyRecipientGroups.TAT_CA.value),
+            "ma_tai_khoan_ca_nhan": self.txt_target_id.text().strip() or None,
+        }
+
+    def _on_save_draft(self) -> None:
+        if self.socket_client is None or not self.socket_client.is_connected():
+            ToastNotification.show_toast(self, "Chưa kết nối tới Server.", variant="warning")
+            return
+        resp = self.socket_client.call(Actions.NOTIFY_SAVE_DRAFT, self._collect_form_payload())
+        if not resp.get("ok"):
+            ToastNotification.show_toast(self, str(resp.get("error") or "Lỗi lưu nháp."), variant="danger")
+            return
+        data = resp.get("data") or {}
+        self._draft_id = str(data.get("draft_id") or "")
+        self.lbl_draft_status.setText(f"Đã lưu nháp: {self._draft_id}")
+        ToastNotification.show_toast(self, f"Đã lưu nháp {self._draft_id}.", variant="success")
+
+    def _on_publish(self) -> None:
+        if self.socket_client is None or not self.socket_client.is_connected():
+            ToastNotification.show_toast(self, "Chưa kết nối tới Server.", variant="warning")
+            return
+        resp = self.socket_client.call(Actions.NOTIFY_PUBLISH, self._collect_form_payload())
+        if not resp.get("ok"):
+            ToastNotification.show_toast(self, str(resp.get("error") or "Gửi thông báo thất bại."), variant="danger")
+            return
+        data = resp.get("data") or {}
+        self._draft_id = None
+        self.lbl_draft_status.setText("Đã phát hành thông báo.")
+        ToastNotification.show_toast(
+            self,
+            f"Đã phát thông báo tới {data.get('tong_nguoi_nhan', 0)} tài khoản "
+            f"(OK: {data.get('so_gui_thanh_cong', 0)}, Lỗi: {data.get('so_gui_that_bai', 0)}).",
+            variant="success" if int(data.get("so_gui_that_bai") or 0) == 0 else "warning",
+        )
+        self.refresh_data()
+
+    def _on_retry_selected(self) -> None:
+        row_idx = self.tbl_sent.currentRow()
+        if row_idx < 0 or row_idx >= len(self._sent_items):
+            ToastNotification.show_toast(self, "Vui lòng chọn thông báo cần thử gửi lại.", variant="warning")
+            return
+        if self.socket_client is None or not self.socket_client.is_connected():
+            return
+        nid = self._sent_items[row_idx].get("ma_thong_bao")
+        resp = self.socket_client.call(
+            Actions.NOTIFY_RETRY_FAILED,
+            {"ma_thong_bao": nid, "include_unacked": True},
+        )
+        if not resp.get("ok"):
+            ToastNotification.show_toast(self, str(resp.get("error") or "Thử gửi lại thất bại."), variant="danger")
+            return
+        data = resp.get("data") or {}
+        ToastNotification.show_toast(
+            self,
+            f"Đã thử gửi lại {data.get('retried_count', 0)} lượt (Thành công: {data.get('so_gui_thanh_cong', 0)}).",
+            variant="success",
+        )
+        self.refresh_data()
+
+    def refresh_data(self) -> None:
+        if self.socket_client is None or not self.socket_client.is_connected():
+            return
+        resp = self.socket_client.call(Actions.NOTIFY_LIST_SENT, {})
+        if not resp.get("ok"):
+            return
+        items = (resp.get("data") or {}).get("items") or []
+        self.apply_sent_items(items)
+
+    def apply_sent_items(self, items: List[Dict[str, Any]]) -> None:
+        self._sent_items = list(items)
+        self.tbl_sent.setRowCount(len(self._sent_items))
+        for i, it in enumerate(self._sent_items):
+            self.tbl_sent.setItem(i, 0, QTableWidgetItem(str(it.get("ma_thong_bao") or "")))
+            self.tbl_sent.setItem(i, 1, QTableWidgetItem(str(it.get("tieu_de") or "")))
+            self.tbl_sent.setItem(i, 2, QTableWidgetItem(f"{it.get('loai_thong_bao')} / {it.get('muc_do')}"))
+            self.tbl_sent.setItem(i, 3, QTableWidgetItem(str(it.get("nhom_nguoi_nhan") or "")))
+            self.tbl_sent.setItem(
+                i, 4, QTableWidgetItem(f"{it.get('so_gui_thanh_cong', 0)} OK / {it.get('so_gui_that_bai', 0)} Lỗi")
+            )
+            self.tbl_sent.setItem(
+                i, 5, QTableWidgetItem(f"{it.get('so_da_tiep_nhan', 0)} ACK / {it.get('so_da_doc', 0)} Đọc")
+            )
+            self.tbl_sent.setItem(i, 6, QTableWidgetItem(str(it.get("thoi_gian_gui") or "")))
+
+        if self._sent_items:
+            self.tbl_sent.selectRow(0)
+            self._populate_recipients(self._sent_items[0].get("recipients") or [])
+        else:
+            self.tbl_recipients.setRowCount(0)
+
+    def _on_sent_selected(self) -> None:
+        idx = self.tbl_sent.currentRow()
+        if 0 <= idx < len(self._sent_items):
+            self._populate_recipients(self._sent_items[idx].get("recipients") or [])
+
+    def _populate_recipients(self, recs: List[Dict[str, Any]]) -> None:
+        self.tbl_recipients.setRowCount(len(recs))
+        for i, r in enumerate(recs):
+            send_st = str(r.get("trang_thai_gui") or "")
+            ack_st = str(r.get("trang_thai_tiep_nhan") or "")
+            read_txt = "Đã đọc" if r.get("da_doc") else "Chưa đọc"
+            self.tbl_recipients.setItem(i, 0, QTableWidgetItem(str(r.get("ten_dang_nhap") or r.get("ma_tai_khoan_nhan"))))
+            self.tbl_recipients.setItem(i, 1, QTableWidgetItem(str(r.get("ho_ten_nhan") or "")))
+            self.tbl_recipients.setItem(i, 2, QTableWidgetItem(str(r.get("vai_tro") or "")))
+            self.tbl_recipients.setCellWidget(
+                i,
+                3,
+                StatusBadge(
+                    "Gửi thành công" if send_st == "gui_thanh_cong" else "Gửi thất bại",
+                    "success" if send_st == "gui_thanh_cong" else "danger",
+                ),
+            )
+            self.tbl_recipients.setItem(i, 4, QTableWidgetItem(str(r.get("so_lan_gui_lai") or 0)))
+            self.tbl_recipients.setItem(
+                i,
+                5,
+                QTableWidgetItem(f"{'Đã tiếp nhận' if ack_st == 'da_tiep_nhan' else 'Chưa tiếp nhận'} · {read_txt}"),
+            )
