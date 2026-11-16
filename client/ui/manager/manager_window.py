@@ -9,6 +9,12 @@ from client.ui.manager.dashboard_view import DashboardView
 from client.ui.manager.finance_view import FinanceView
 from client.ui.manager.hr_view import HRView
 from client.ui.manager.infra_pricing_view import InfraPricingView
+from client.ui.manager.stats_history_view import (
+    ManagerHistoryView,
+    ManagerMonitorView,
+    ManagerNotifyView,
+    ManagerStatsView,
+)
 from client.ui.theme.components import EmptyStateWidget
 from client.ui.theme.role_shell import RolePortalWindow
 
@@ -63,10 +69,26 @@ class ManagerWindow(RolePortalWindow):
         self.finance_view = custom_views.get("1.7_billing") or FinanceView(
             socket_client=socket_client, read_only=False
         )
+        self.monitor_view = custom_views.get("1.6_monitor") or ManagerMonitorView(
+            socket_client=socket_client, read_only=False
+        )
+        self.stats_view = custom_views.get("1.8_stats") or ManagerStatsView(
+            socket_client=socket_client, read_only=False
+        )
+        self.history_view = custom_views.get("1.9_history") or ManagerHistoryView(
+            socket_client=socket_client, read_only=False
+        )
+        self.notify_view = custom_views.get("1.10_notify") or ManagerNotifyView(
+            socket_client=socket_client, read_only=False
+        )
         custom_views.setdefault("1.3_staff_resident", self.hr_view)
         custom_views.setdefault("1.4_slots", self.infra_view)
         custom_views.setdefault("1.5_pricing", self.pricing_view)
+        custom_views.setdefault("1.6_monitor", self.monitor_view)
         custom_views.setdefault("1.7_billing", self.finance_view)
+        custom_views.setdefault("1.8_stats", self.stats_view)
+        custom_views.setdefault("1.9_history", self.history_view)
+        custom_views.setdefault("1.10_notify", self.notify_view)
 
         for key, label, desc, owner in _MANAGER_PLACEHOLDERS:
             widget = custom_views.get(key)
@@ -98,6 +120,15 @@ class ManagerWindow(RolePortalWindow):
     def load_initial_data(self) -> None:
         """Nạp dữ liệu Dashboard & nghiệp vụ Quản lý qua TCP Socket."""
         self.dashboard_view.refresh_data()
-        for view in (self.hr_view, self.infra_view, self.pricing_view, self.finance_view):
+        for view in (
+            self.hr_view,
+            self.infra_view,
+            self.pricing_view,
+            self.monitor_view,
+            self.finance_view,
+            self.stats_view,
+            self.history_view,
+            self.notify_view,
+        ):
             if hasattr(view, "refresh_data"):
                 view.refresh_data()

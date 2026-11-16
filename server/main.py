@@ -98,6 +98,17 @@ def _register_available_handlers(ctx: ServerContext) -> None:
     except ImportError:
         pass
 
+    try:
+        from server.handlers.notify_handler import register_notify_routes
+
+        register_notify_routes(
+            ctx.router,
+            session_manager=ctx.session_manager,
+            file_logger=ctx.file_logger,
+        )
+    except ImportError:
+        pass
+
 
 def create_socket_server(
     config: Optional[ServerConfig] = None,
