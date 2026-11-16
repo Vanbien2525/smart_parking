@@ -780,6 +780,108 @@ class AuthHRHandler:
             raise BusinessError("Không tìm thấy hồ sơ cư dân.")
         return {"resident": row}
 
+    # ==========================================================================
+    # CHỨC NĂNG 1.3.4 & 1.3.5: KHÓA / KÍCH HOẠT LẠI TÀI KHOẢN CƯ DÂN
+    # ==========================================================================
+    def _set_account_status(
+        self,
+        session: ClientSession,
+        *,
+        ma_tai_khoan: int,
+        new_status: str,
+        ly_do_khoa: Optional[str],
+        expected_roles: tuple[str, ...],
+        action_label: str,
+    ) -> Dict[str, Any]:
+        """Helper dùng chung để khóa/mở khóa tài khoản, thu hồi phiên và ghi audit log."""
+        if ma_tai_khoan == session.ma_tai_khoan and new_status == AccountStatus.TAM_KHOA.value:
+            raise BusinessError("Không thể tự khóa tài khoản đang đăng nhập của chính mình.")
+
+        db = self._db()
+        acc = db.fetch_one(
+            "SELECT ma_tai_khoan, ten_dang_nhap, vai_tro, trang_thai, ly_do_khoa FROM tai_khoan WHERE ma_tai_khoan = %s",
+            (int(ma_tai_khoan),),
+        )
+        if not acc:
+            raise BusinessError(f"Không tìm thấy tài khoản mã {ma_tai_khoan}.")
+        if acc.get("vai_tro") not in expected_roles:
+            raise BusinessError("Loại tài khoản không khớp với thao tác yêu cầu.")
+
+        old_status = str(acc.get("trang_thai") or "")
+        old_reason = acc.get("ly_do_khoa")
+        clean_reason = (ly_do_khoa or "").strip() if new_status == AccountStatus.TAM_KHOA.value else None
+        if new_status == AccountStatus.TAM_KHOA.value and not clean_reason:
+            raise BusinessError("Vui lòng nhập lý do ngừng hoạt động tài khoản.")
+
+        db.execute(
+            "UPDATE tai_khoan SET trang_thai = %s, ly_do_khoa = %s WHERE ma_tai_khoan = %s",
+            (new_status, clean_reason, int(ma_tai_khoan)),
+        )
+
+        revoked = 0
+        if new_status == AccountStatus.TAM_KHOA.value:
+            revoked = self.session_manager.revoke_user_sessions(
+                int(ma_tai_khoan),
+                f"Tài khoản đã bị tạm khóa: {clean_reason}",
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac=action_label,
+            doi_tuong="tai_khoan",
+            ma_doi_tuong=int(ma_tai_khoan),
+            gia_tri_cu={"trang_thai": old_status, "ly_do_khoa": old_reason},
+            gia_tri_moi={"trang_thai": new_status, "ly_do_khoa": clean_reason, "revoked_sessions": revoked},
+        )
+        return {
+            "ma_tai_khoan": int(ma_tai_khoan),
+            "trang_thai": new_status,
+            "ly_do_khoa": clean_reason,
+            "revoked_sessions": revoked,
+        }
+
+    def _resolve_resident_account_id(self, payload: Dict[str, Any]) -> int:
+        if payload.get("ma_tai_khoan") is not None:
+            return int(payload["ma_tai_khoan"])
+        if payload.get("ma_cu_dan") is not None:
+            row = self._db().fetch_one(
+                "SELECT ma_tai_khoan FROM cu_dan WHERE ma_cu_dan = %s",
+                (int(payload["ma_cu_dan"]),),
+            )
+            if row:
+                return int(row["ma_tai_khoan"])
+        raise BusinessError("Không xác định được tài khoản cư dân cần thao tác.")
+
+    def handle_deactivate_resident(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.4: Ngừng hoạt động tài khoản cư dân và thu hồi mọi phiên đang mở."""
+        ma_tk = self._resolve_resident_account_id(payload)
+        return self._set_account_status(
+            session,
+            ma_tai_khoan=ma_tk,
+            new_status=AccountStatus.TAM_KHOA.value,
+            ly_do_khoa=str(payload.get("ly_do_khoa") or payload.get("ly_do") or ""),
+            expected_roles=(Roles.CU_DAN.value,),
+            action_label="KHOA_TK_CU_DAN",
+        )
+
+    def handle_activate_resident(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.3.5: Kích hoạt lại tài khoản cư dân."""
+        ma_tk = self._resolve_resident_account_id(payload)
+        return self._set_account_status(
+            session,
+            ma_tai_khoan=ma_tk,
+            new_status=AccountStatus.HOAT_DONG.value,
+            ly_do_khoa=None,
+            expected_roles=(Roles.CU_DAN.value,),
+            action_label="KICH_HOAT_TK_CU_DAN",
+        )
+
 
 def register_auth_hr_routes(
     router: Router,
@@ -877,6 +979,20 @@ def register_auth_hr_routes(
         handler.handle_get_resident,
         allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_DEACTIVATE_RESIDENT,
+        handler.handle_deactivate_resident,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.HR_ACTIVATE_RESIDENT,
+        handler.handle_activate_resident,
+        allowed_roles=[Roles.QUAN_LY.value],
+        is_mutation=True,
         require_auth=True,
     )
     return handler
