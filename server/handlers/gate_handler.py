@@ -7,10 +7,15 @@ Bao gồm đầy đủ 11 chức năng lá:
 - 2.5.1 – 2.5.3: Tra cứu phương tiện tại chốt bảo vệ kèm lịch sử ảnh cổng vào/ra
 """
 
+import base64
 from datetime import datetime
+import io
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
+
+import qrcode
 
 from server.config import DEFAULT_CONFIG, ensure_storage_dirs
 from server.core.file_logger import FileLogger
@@ -19,6 +24,8 @@ from server.core.session_manager import ClientSession, SessionManager
 from server.core.state_store import StateStore
 from shared.constants import (
     ParkingHistoryStatus,
+    PricingGroups,
+    PricingStatus,
     Roles,
     SlotStatus,
     VehicleStatus,
@@ -651,3 +658,261 @@ class GateHandler:
             "entry": result_record,
             "message": f"Đã mở cổng cho xe {result_record['bien_so_xe']} vào bãi ({result_record.get('ten_vi_tri') or result_record.get('ten_khu_vuc')}).",
         }
+
+    # ==========================================================================
+    # HELPERS ĐỐI CHIẾU ẢNH, TÍNH PHÍ VÃNG LAI & SINH MÃ QR
+    # ==========================================================================
+    @staticmethod
+    def _load_image_base64(path_or_b64: Optional[str]) -> str:
+        if not path_or_b64:
+            return ""
+        text = str(path_or_b64).strip()
+        if not text:
+            return ""
+        if text.startswith("data:image/"):
+            return text.split(",", 1)[1] if "," in text else text
+        candidate = Path(text)
+        if candidate.is_file():
+            try:
+                return base64.b64encode(candidate.read_bytes()).decode("ascii")
+            except OSError:
+                return ""
+        rel = DEFAULT_CONFIG.base_dir / text
+        if rel.is_file():
+            try:
+                return base64.b64encode(rel.read_bytes()).decode("ascii")
+            except OSError:
+                return ""
+        return ""
+
+    @staticmethod
+    def _parse_iso_datetime(value: Any, fallback: Optional[datetime] = None) -> datetime:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        if value:
+            text = str(value).strip()
+            try:
+                return datetime.fromisoformat(text).replace(tzinfo=None)
+            except ValueError:
+                pass
+        return fallback or datetime.now()
+
+    @staticmethod
+    def _format_duration_text(total_minutes: int) -> str:
+        mins = max(1, int(total_minutes))
+        hours, rem = divmod(mins, 60)
+        days, rem_hours = divmod(hours, 24)
+        parts: List[str] = []
+        if days > 0:
+            parts.append(f"{days} ngày")
+        if rem_hours > 0:
+            parts.append(f"{rem_hours} giờ")
+        if rem > 0 or not parts:
+            parts.append(f"{rem} phút")
+        return " ".join(parts)
+
+    @staticmethod
+    def _render_qr_base64(qr_payload: str) -> str:
+        qr = qrcode.QRCode(version=1, box_size=8, border=2)
+        qr.add_data(qr_payload)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _find_open_entry_log(self, normalized_plate: str) -> Optional[Dict[str, Any]]:
+        rows = self.file_logger.query_logs(
+            "parking_history",
+            filters={"bien_so_xe": normalized_plate, "trang_thai": ParkingHistoryStatus.DANG_GUI.value},
+            limit=10,
+        )
+        for row in rows:
+            if normalize_plate(str(row.get("bien_so_xe") or "")) == normalized_plate:
+                return row
+        return None
+
+    def _calculate_visitor_fee(
+        self,
+        db_or_tx: Any,
+        ma_loai_xe: str,
+        thoi_gian_vao: datetime,
+        thoi_gian_ra: datetime,
+    ) -> Dict[str, Any]:
+        """Tính phí gửi xe vãng lai dựa trên bảng `bang_gia` (nhom_ap_dung='khach_vang_lai')."""
+        diff_seconds = max(60.0, (thoi_gian_ra - thoi_gian_vao).total_seconds())
+        so_phut = max(1, int(math.ceil(diff_seconds / 60.0)))
+        so_gio = max(1, int(math.ceil(so_phut / 60.0)))
+
+        pricing = db_or_tx.fetch_one(
+            """
+            SELECT ma_bang_gia, don_vi_tinh, muc_phi
+            FROM bang_gia
+            WHERE ma_loai_xe = %s
+              AND nhom_ap_dung = %s
+              AND trang_thai_gia = %s
+            ORDER BY thoi_gian_bat_dau DESC, ma_bang_gia DESC
+            LIMIT 1
+            """,
+            (
+                ma_loai_xe,
+                PricingGroups.KHACH_VANG_LAI.value,
+                PricingStatus.DANG_AP_DUNG.value,
+            ),
+        )
+
+        if pricing:
+            don_vi = str(pricing.get("don_vi_tinh") or "gio").strip().lower()
+            muc_phi = float(pricing.get("muc_phi") or 0)
+        else:
+            don_vi = "gio" if ma_loai_xe == VehicleTypes.O_TO.value else "luot"
+            muc_phi = 25000.0 if ma_loai_xe == VehicleTypes.O_TO.value else 5000.0
+
+        if don_vi == "gio":
+            so_don_vi = so_gio
+            so_tien = float(so_don_vi) * muc_phi
+            cong_thuc = f"{so_don_vi} giờ × {int(muc_phi):,} VNĐ/giờ"
+        elif don_vi == "luot":
+            so_don_vi = max(1, int(math.ceil(so_gio / 4.0)))
+            so_tien = float(so_don_vi) * muc_phi
+            cong_thuc = f"{so_don_vi} lượt (block 4h) × {int(muc_phi):,} VNĐ/lượt"
+        else:
+            so_don_vi = max(1, int(math.ceil(so_gio / 24.0)))
+            so_tien = float(so_don_vi) * muc_phi
+            cong_thuc = f"{so_don_vi} kỳ × {int(muc_phi):,} VNĐ"
+
+        return {
+            "so_phut_gui": so_phut,
+            "so_gio_gui": so_gio,
+            "thoi_luong_text": self._format_duration_text(so_phut),
+            "don_vi_tinh": don_vi,
+            "don_gia": muc_phi,
+            "so_don_vi": so_don_vi,
+            "so_tien_phai_thu": round(so_tien, 2),
+            "cong_thuc_text": cong_thuc,
+        }
+
+    # ==========================================================================
+    # NHÓM 2.3.1 – 2.3.2: ĐỐI CHIẾU XE CỔNG RA & TÍNH PHÍ VÃNG LAI TỰ ĐỘNG
+    # ==========================================================================
+    def handle_gate_out_check(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """2.3.1–2.3.2: Kiểm tra xe trong bãi khi ra cổng, trả ảnh lúc vào & bảng tính phí."""
+        self._ensure_staff_role(session)
+
+        raw_plate = str(payload.get("bien_so") or payload.get("bien_so_xe") or "").strip()
+        if not raw_plate:
+            raise BusinessError("Vui lòng nhập hoặc nhận diện biển số xe tại cổng ra.")
+
+        ok_plate, valid_or_err = validate_plate(raw_plate)
+        if not ok_plate:
+            raise BusinessError(valid_or_err)
+        normalized_plate = valid_or_err
+
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat(timespec="seconds")
+        db = self._db()
+
+        # 1. Kiểm tra xe cư dân đang đỗ trong bãi
+        resident_in = db.fetch_one(
+            """
+            SELECT pt.ma_phuong_tien, pt.ma_loai_xe, pt.bien_so_xe,
+                   pt.ten_hang_dong_xe, pt.mau_xe,
+                   cd.ho_ten, cd.so_dien_thoai, cd.ma_can_ho,
+                   ql.ma_vi_tri_co_dinh, ql.ma_khu_vuc_phan_cong, ql.thoi_gian_vao,
+                   vt.ten_vi_tri AS ten_vi_tri_co_dinh,
+                   vt.ma_khu_vuc AS ma_khu_vuc_vi_tri,
+                   kv.ten_khu_vuc
+            FROM quan_ly_phuong_tien_ra_vao ql
+            JOIN phuong_tien pt ON pt.ma_phuong_tien = ql.ma_phuong_tien
+            JOIN cu_dan cd ON cd.ma_cu_dan = pt.ma_cu_dan
+            LEFT JOIN vi_tri_do vt ON vt.ma_vi_tri = ql.ma_vi_tri_co_dinh
+            LEFT JOIN khu_vuc kv ON kv.ma_khu_vuc = COALESCE(ql.ma_khu_vuc_phan_cong, vt.ma_khu_vuc)
+            WHERE pt.bien_so_xe = %s AND ql.dang_trong_bai = TRUE
+            """,
+            (normalized_plate,),
+        )
+
+        if resident_in:
+            entry_log = self._find_open_entry_log(normalized_plate)
+            entry_dt = self._parse_iso_datetime(
+                resident_in.get("thoi_gian_vao") or (entry_log or {}).get("thoi_gian_vao"),
+                fallback=now_dt,
+            )
+            mins = max(1, int(math.ceil(max(60.0, (now_dt - entry_dt).total_seconds()) / 60.0)))
+            ma_khu_vuc = (
+                resident_in.get("ma_khu_vuc_phan_cong")
+                or resident_in.get("ma_khu_vuc_vi_tri")
+                or ""
+            )
+            anh_vao_path = (entry_log or {}).get("anh_vao")
+            return {
+                "checked_at": now_iso,
+                "bien_so_xe": normalized_plate,
+                "loai_khach": "cu_dan",
+                "ma_loai_xe": str(resident_in.get("ma_loai_xe") or VehicleTypes.O_TO.value),
+                "ma_phuong_tien": int(resident_in["ma_phuong_tien"]),
+                "ma_luot_gui": (entry_log or {}).get("ma_luot_gui") or "",
+                "chu_xe": {
+                    "ho_ten": resident_in.get("ho_ten") or "",
+                    "so_dien_thoai": resident_in.get("so_dien_thoai") or "",
+                    "ma_can_ho": resident_in.get("ma_can_ho") or "",
+                },
+                "ma_vi_tri": resident_in.get("ma_vi_tri_co_dinh"),
+                "ten_vi_tri": resident_in.get("ten_vi_tri_co_dinh") or resident_in.get("ma_vi_tri_co_dinh") or "",
+                "ma_khu_vuc": ma_khu_vuc,
+                "ten_khu_vuc": resident_in.get("ten_khu_vuc") or ma_khu_vuc,
+                "thoi_gian_vao": entry_dt.isoformat(timespec="seconds"),
+                "thoi_gian_ra": now_iso,
+                "thoi_luong_phut": mins,
+                "thoi_luong_text": self._format_duration_text(mins),
+                "don_gia": 0.0,
+                "don_vi_tinh": "thang",
+                "so_tien_phai_thu": 0.0,
+                "cong_thuc_text": "XE CƯ DÂN — MIỄN THU PHÍ LƯỢT (0 VNĐ)",
+                "anh_cong_vao": anh_vao_path or "",
+                "anh_cong_vao_base64": self._load_image_base64(anh_vao_path),
+                "qr_payload": "",
+                "qr_image_base64": "",
+            }
+
+        # 2. Kiểm tra xe vãng lai đang mở phiên trong StateStore (active_vang_lai.json)
+        visitor = self.state_store.get_visitor_by_plate(normalized_plate)
+        if visitor:
+            ma_loai_xe = str(visitor.get("ma_loai_xe") or VehicleTypes.O_TO.value)
+            entry_dt = self._parse_iso_datetime(visitor.get("thoi_gian_vao"), fallback=now_dt)
+            fee_info = self._calculate_visitor_fee(db, ma_loai_xe, entry_dt, now_dt)
+            ma_luot_gui = str(visitor.get("ma_luot_gui") or "")
+            qr_payload = (
+                f"SMARTPARKING|CHUNG_CU_DAO_TIEN|VANG_LAI|{normalized_plate}|"
+                f"{int(fee_info['so_tien_phai_thu'])}|{ma_luot_gui}"
+            )
+            anh_vao_path = visitor.get("anh_vao")
+            return {
+                "checked_at": now_iso,
+                "bien_so_xe": normalized_plate,
+                "loai_khach": "vang_lai",
+                "ma_loai_xe": ma_loai_xe,
+                "ma_luot_gui": ma_luot_gui,
+                "ma_vi_tri": visitor.get("ma_vi_tri"),
+                "ten_vi_tri": visitor.get("ten_vi_tri") or visitor.get("ma_vi_tri") or "",
+                "ma_khu_vuc": visitor.get("ma_khu_vuc") or "",
+                "ten_khu_vuc": visitor.get("ten_khu_vuc") or visitor.get("ma_khu_vuc") or "",
+                "thoi_gian_vao": entry_dt.isoformat(timespec="seconds"),
+                "thoi_gian_ra": now_iso,
+                "thoi_luong_phut": fee_info["so_phut_gui"],
+                "thoi_luong_text": fee_info["thoi_luong_text"],
+                "don_gia": fee_info["don_gia"],
+                "don_vi_tinh": fee_info["don_vi_tinh"],
+                "so_tien_phai_thu": fee_info["so_tien_phai_thu"],
+                "cong_thuc_text": fee_info["cong_thuc_text"],
+                "anh_cong_vao": anh_vao_path or "",
+                "anh_cong_vao_base64": self._load_image_base64(anh_vao_path),
+                "qr_payload": qr_payload,
+                "qr_image_base64": self._render_qr_base64(qr_payload),
+            }
+
+        raise BusinessError(
+            f"Không tìm thấy phiên gửi xe đang mở trong bãi cho biển số '{normalized_plate}'!"
+        )
