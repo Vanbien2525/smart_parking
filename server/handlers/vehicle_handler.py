@@ -8,6 +8,8 @@ Bao gồm toàn bộ 23 chức năng lá:
 - 3.4.1 – 3.4.4: Tra cứu & định vị xe của cư dân
 """
 
+import base64
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +27,7 @@ from shared.constants import (
     VehicleTypes,
 )
 from shared.protocol import Actions
+from shared.validators import save_base64_image, validate_license_plate
 
 
 def _resolve_db(db_provider: Any = None) -> Any:
@@ -287,6 +290,215 @@ class VehicleHandler:
             "requests": requests,
         }
 
+    # --------------------------------------------------------------------------
+    # HELPERS LƯU & ĐỌC ẢNH CÀ-VẸT BASE64
+    # --------------------------------------------------------------------------
+    def _save_cavet_base64(self, b64_str: str, prefix: str) -> str:
+        """Giải mã Base64, kiểm tra <= 5MB và lưu vào thư mục storage/uploads/cavet/."""
+        saved_path = Path(
+            save_base64_image(
+                b64_str=b64_str,
+                dest_dir=self.cavet_dir,
+                prefix=prefix,
+                max_bytes=5 * 1024 * 1024,
+            )
+        )
+        try:
+            rel = saved_path.resolve().relative_to(DEFAULT_CONFIG.base_dir.resolve())
+            return rel.as_posix()
+        except ValueError:
+            return str(saved_path)
+
+    def _resolve_cavet_path(self, raw_path: str) -> Path:
+        """Phân giải đường dẫn ảnh cà-vẹt an toàn (hỗ trợ cả path tương đối và tuyệt đối)."""
+        candidate = Path(raw_path)
+        if candidate.is_file():
+            return candidate
+        under_base = DEFAULT_CONFIG.base_dir / raw_path
+        if under_base.is_file():
+            return under_base
+        under_cavet = self.cavet_dir / candidate.name
+        if under_cavet.is_file():
+            return under_cavet
+        raise BusinessError(f"Không tìm thấy tệp ảnh cà-vẹt: '{raw_path}'.")
+
+    # ==========================================================================
+    # 3.2.1 (Workflow 02): CƯ DÂN ĐĂNG KÝ XE MỚI + UPLOAD ẢNH CÀ-VẸT BASE64
+    # ==========================================================================
+    def handle_submit_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.2.1 / 3.2.4 / 3.2.5: Cư dân gửi yêu cầu đăng ký mới, sửa hoặc ngừng đăng ký xe."""
+        loai_yeu_cau = str(
+            payload.get("loai_yeu_cau") or VehicleRequestTypes.DANG_KY_MOI.value
+        ).strip()
+        if loai_yeu_cau == VehicleRequestTypes.DANG_KY_MOI.value:
+            return self._submit_new_vehicle_request(session, payload)
+        raise BusinessError(f"Loại yêu cầu '{loai_yeu_cau}' chưa được hỗ trợ.")
+
+    def _submit_new_vehicle_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        ma_loai_xe = str(payload.get("ma_loai_xe") or payload.get("loai_xe") or "").strip().upper()
+        if ma_loai_xe not in (VehicleTypes.O_TO.value, VehicleTypes.XE_MAY.value):
+            raise BusinessError("Loại xe phải là `O_TO` hoặc `XE_MAY`.")
+
+        raw_plate = str(payload.get("bien_so_xe") or payload.get("bien_so") or "").strip()
+        ok_plate, plate_or_err = validate_license_plate(raw_plate, ma_loai_xe)
+        if not ok_plate:
+            raise BusinessError(plate_or_err)
+        bien_so = plate_or_err
+
+        ten_xe = str(payload.get("ten_hang_dong_xe") or payload.get("ten_xe") or "").strip()
+        if not ten_xe:
+            raise BusinessError("Vui lòng nhập tên hãng / dòng xe.")
+        mau_xe = str(payload.get("mau_xe") or "").strip() or None
+        vi_tri_mong_muon = str(payload.get("vi_tri_mong_muon") or payload.get("ghi_chu") or "").strip() or None
+
+        cavet_b64 = str(
+            payload.get("cavet_image_base64") or payload.get("cavet_base64") or ""
+        ).strip()
+        if not cavet_b64:
+            raise BusinessError("Vui lòng đính kèm ảnh cà-vẹt xe (giấy đăng ký xe).")
+
+        db = self._db()
+        with db.transaction() as tx:
+            ma_cu_dan, ma_can_ho, apartment = self._resolve_resident_context(tx, session)
+
+            if ma_loai_xe == VehicleTypes.O_TO.value:
+                quota = self._get_apartment_quota_stats(tx, ma_can_ho, apartment)
+                if quota["so_oto_dang_hoat_dong"] + quota["so_oto_cho_duyet"] >= quota["tong_suat_oto"]:
+                    raise BusinessError(
+                        f"Căn hộ {ma_can_ho} đã sử dụng hết hạn mức {quota['tong_suat_oto']} suất ô tô "
+                        "(bao gồm xe đang hoạt động và hồ sơ chờ duyệt). "
+                        "Vui lòng gửi Yêu cầu mua thêm chỗ đỗ ô tô (3.3.1) trước."
+                    )
+
+            existing = tx.fetch_one(
+                "SELECT ma_phuong_tien, trang_thai_xe FROM phuong_tien WHERE bien_so_xe = %s FOR UPDATE",
+                (bien_so,),
+            )
+            if existing and existing["trang_thai_xe"] in (
+                VehicleStatus.DANG_HOAT_DONG.value,
+                "cho_duyet",
+            ):
+                raise BusinessError(f"Biển số '{bien_so}' đã được đăng ký hoặc đang chờ duyệt.")
+
+            duong_dan_cavet = self._save_cavet_base64(
+                cavet_b64, prefix=f"cavet_{ma_cu_dan}_{bien_so}"
+            )
+
+            if existing:
+                vehicle_row = tx.execute_returning(
+                    """
+                    UPDATE phuong_tien
+                    SET ma_cu_dan = %s,
+                        ma_loai_xe = %s,
+                        ten_hang_dong_xe = %s,
+                        mau_xe = %s,
+                        duong_dan_cavet = %s,
+                        trang_thai_xe = 'cho_duyet'
+                    WHERE ma_phuong_tien = %s
+                    RETURNING *
+                    """,
+                    (ma_cu_dan, ma_loai_xe, ten_xe, mau_xe, duong_dan_cavet, existing["ma_phuong_tien"]),
+                )
+            else:
+                vehicle_row = tx.execute_returning(
+                    """
+                    INSERT INTO phuong_tien (
+                        ma_cu_dan, ma_loai_xe, bien_so_xe, ten_hang_dong_xe,
+                        mau_xe, duong_dan_cavet, trang_thai_xe
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'cho_duyet')
+                    RETURNING *
+                    """,
+                    (ma_cu_dan, ma_loai_xe, bien_so, ten_xe, mau_xe, duong_dan_cavet),
+                )
+
+            req_row = tx.execute_returning(
+                """
+                INSERT INTO yeu_cau_dang_ky_xe (
+                    ma_cu_dan, ma_phuong_tien, loai_yeu_cau,
+                    vi_tri_mong_muon, trang_thai_duyet
+                ) VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    ma_cu_dan,
+                    vehicle_row["ma_phuong_tien"],
+                    VehicleRequestTypes.DANG_KY_MOI.value,
+                    vi_tri_mong_muon,
+                    RequestStatus.CHO_DUYET.value,
+                ),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GUI_YEU_CAU_DANG_KY_XE",
+            doi_tuong="yeu_cau_dang_ky_xe",
+            ma_doi_tuong=req_row["ma_yeu_cau_xe"] if req_row else None,
+            gia_tri_cu=None,
+            gia_tri_moi={
+                "bien_so_xe": bien_so,
+                "ma_loai_xe": ma_loai_xe,
+                "duong_dan_cavet": duong_dan_cavet,
+            },
+        )
+        return {"request": req_row, "vehicle": vehicle_row}
+
+    def handle_get_cavet(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tải ảnh cà-vẹt độ phân giải gốc (Base64) qua TCP Socket cho Quản lý/Admin/Chủ xe."""
+        db = self._db()
+        ma_phuong_tien = payload.get("ma_phuong_tien")
+        raw_path = str(payload.get("duong_dan_cavet") or "").strip()
+
+        vehicle = None
+        if ma_phuong_tien is not None:
+            try:
+                vid = int(ma_phuong_tien)
+            except (TypeError, ValueError) as exc:
+                raise BusinessError("Mã phương tiện không hợp lệ.") from exc
+            vehicle = db.fetch_one(
+                "SELECT ma_phuong_tien, ma_cu_dan, bien_so_xe, duong_dan_cavet FROM phuong_tien WHERE ma_phuong_tien = %s",
+                (vid,),
+            )
+            if not vehicle:
+                raise BusinessError(f"Không tìm thấy phương tiện #{vid}.")
+            if not raw_path:
+                raw_path = str(vehicle.get("duong_dan_cavet") or "")
+        elif raw_path:
+            vehicle = db.fetch_one(
+                "SELECT ma_phuong_tien, ma_cu_dan, bien_so_xe, duong_dan_cavet FROM phuong_tien WHERE duong_dan_cavet = %s",
+                (raw_path,),
+            )
+
+        if session.vai_tro == Roles.CU_DAN.value:
+            ma_cu_dan, _, _ = self._resolve_resident_context(db, session)
+            if vehicle is None or int(vehicle["ma_cu_dan"]) != ma_cu_dan:
+                raise PermissionError("Bạn chỉ được xem ảnh cà-vẹt của phương tiện thuộc tài khoản mình.")
+        elif session.vai_tro not in (Roles.QUAN_LY.value, Roles.ADMIN.value):
+            raise PermissionError("Không có quyền truy cập ảnh cà-vẹt.")
+
+        if not raw_path:
+            raise BusinessError("Phương tiện chưa có đường dẫn ảnh cà-vẹt.")
+
+        img_path = self._resolve_cavet_path(raw_path)
+        raw_bytes = img_path.read_bytes()
+        ext = img_path.suffix.lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        return {
+            "ma_phuong_tien": vehicle["ma_phuong_tien"] if vehicle else None,
+            "bien_so_xe": vehicle["bien_so_xe"] if vehicle else None,
+            "filename": img_path.name,
+            "mime_type": mime,
+            "duong_dan_cavet": raw_path,
+            "image_base64": base64.b64encode(raw_bytes).decode("ascii"),
+        }
+
 
 def register_vehicle_routes(
     router: Router,
@@ -304,6 +516,18 @@ def register_vehicle_routes(
         Actions.VEHICLE_RESIDENT_LIST,
         handler.handle_resident_list,
         allowed_roles=[Roles.CU_DAN.value],
+        is_mutation=False,
+    )
+    router.register(
+        Actions.VEHICLE_SUBMIT_REQUEST,
+        handler.handle_submit_request,
+        allowed_roles=[Roles.CU_DAN.value],
+        is_mutation=True,
+    )
+    router.register(
+        Actions.VEHICLE_GET_CAVET,
+        handler.handle_get_cavet,
+        allowed_roles=[Roles.CU_DAN.value, Roles.QUAN_LY.value, Roles.ADMIN.value],
         is_mutation=False,
     )
     return handler
