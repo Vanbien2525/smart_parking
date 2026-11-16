@@ -334,7 +334,187 @@ class VehicleHandler:
         ).strip()
         if loai_yeu_cau == VehicleRequestTypes.DANG_KY_MOI.value:
             return self._submit_new_vehicle_request(session, payload)
-        raise BusinessError(f"Loại yêu cầu '{loai_yeu_cau}' chưa được hỗ trợ.")
+        if loai_yeu_cau == VehicleRequestTypes.CHINH_SUA_THONG_TIN.value:
+            return self._submit_edit_vehicle_request(session, payload)
+        if loai_yeu_cau == VehicleRequestTypes.NGUNG_DANG_KY.value:
+            return self._submit_stop_vehicle_request(session, payload)
+        raise BusinessError(f"Loại yêu cầu '{loai_yeu_cau}' không hợp lệ.")
+
+    def _verify_resident_owned_vehicle(
+        self, tx: Any, ma_cu_dan: int, raw_vehicle_id: Any
+    ) -> Dict[str, Any]:
+        """Xác thực phương tiện thuộc cư dân, đang hoạt động và chưa có yêu cầu chờ duyệt."""
+        try:
+            ma_phuong_tien = int(raw_vehicle_id)
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("Thiếu hoặc sai định dạng `ma_phuong_tien`.") from exc
+
+        vehicle = tx.fetch_one(
+            """
+            SELECT pt.*, ql.dang_trong_bai, ql.ma_vi_tri_co_dinh, ql.ma_khu_vuc_phan_cong
+            FROM phuong_tien pt
+            LEFT JOIN quan_ly_phuong_tien_ra_vao ql ON ql.ma_phuong_tien = pt.ma_phuong_tien
+            WHERE pt.ma_phuong_tien = %s
+            FOR UPDATE OF pt
+            """,
+            (ma_phuong_tien,),
+        )
+        if not vehicle:
+            raise BusinessError(f"Không tìm thấy phương tiện #{ma_phuong_tien}.")
+        if int(vehicle["ma_cu_dan"]) != ma_cu_dan:
+            raise PermissionError("Bạn không có quyền thao tác trên phương tiện của cư dân khác.")
+        if vehicle["trang_thai_xe"] != VehicleStatus.DANG_HOAT_DONG.value:
+            raise BusinessError("Chỉ có thể gửi yêu cầu cho phương tiện đang hoạt động.")
+
+        pending = tx.fetch_one(
+            """
+            SELECT ma_yeu_cau_xe
+            FROM yeu_cau_dang_ky_xe
+            WHERE ma_phuong_tien = %s AND trang_thai_duyet = %s
+            """,
+            (ma_phuong_tien, RequestStatus.CHO_DUYET.value),
+        )
+        if pending:
+            raise BusinessError("Phương tiện này đang có một yêu cầu chờ duyệt, không thể gửi thêm.")
+        return vehicle
+
+    def _submit_edit_vehicle_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.2.4: Gửi yêu cầu chỉnh sửa thông tin xe (biển số, tên xe, màu xe, cà-vẹt mới)."""
+        db = self._db()
+        with db.transaction() as tx:
+            ma_cu_dan, _, _ = self._resolve_resident_context(tx, session)
+            vehicle = self._verify_resident_owned_vehicle(
+                tx, ma_cu_dan, payload.get("ma_phuong_tien")
+            )
+
+            ma_loai_xe = str(vehicle["ma_loai_xe"])
+            raw_new_plate = str(
+                payload.get("bien_so_xe") or payload.get("bien_so") or vehicle["bien_so_xe"]
+            ).strip()
+            ok_plate, plate_or_err = validate_license_plate(raw_new_plate, ma_loai_xe)
+            if not ok_plate:
+                raise BusinessError(plate_or_err)
+            new_plate = plate_or_err
+
+            if new_plate != vehicle["bien_so_xe"]:
+                dup = tx.fetch_one(
+                    "SELECT ma_phuong_tien FROM phuong_tien WHERE bien_so_xe = %s AND ma_phuong_tien <> %s",
+                    (new_plate, vehicle["ma_phuong_tien"]),
+                )
+                if dup:
+                    raise BusinessError(f"Biển số mới '{new_plate}' đã tồn tại trên hệ thống.")
+
+            new_ten_xe = str(
+                payload.get("ten_hang_dong_xe") or payload.get("ten_xe") or vehicle["ten_hang_dong_xe"]
+            ).strip()
+            if not new_ten_xe:
+                raise BusinessError("Tên hãng / dòng xe không được để trống.")
+            new_mau_xe = str(
+                payload.get("mau_xe") if payload.get("mau_xe") is not None else (vehicle.get("mau_xe") or "")
+            ).strip()
+
+            changes: Dict[str, Any] = {
+                "bien_so_xe": new_plate,
+                "ten_hang_dong_xe": new_ten_xe,
+                "mau_xe": new_mau_xe,
+            }
+
+            cavet_b64 = str(
+                payload.get("cavet_image_base64") or payload.get("cavet_base64") or ""
+            ).strip()
+            if cavet_b64:
+                changes["duong_dan_cavet"] = self._save_cavet_base64(
+                    cavet_b64, prefix=f"cavet_edit_{ma_cu_dan}_{new_plate}"
+                )
+
+            note = str(payload.get("ghi_chu") or payload.get("noi_dung_thay_doi") or "").strip()
+            if note:
+                changes["ghi_chu"] = note[:160]
+
+            changes_json = json.dumps(changes, ensure_ascii=False)
+            if len(changes_json) > 500:
+                changes.pop("ghi_chu", None)
+                changes_json = json.dumps(changes, ensure_ascii=False)[:500]
+
+            req_row = tx.execute_returning(
+                """
+                INSERT INTO yeu_cau_dang_ky_xe (
+                    ma_cu_dan, ma_phuong_tien, loai_yeu_cau,
+                    noi_dung_thay_doi, trang_thai_duyet
+                ) VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    ma_cu_dan,
+                    vehicle["ma_phuong_tien"],
+                    VehicleRequestTypes.CHINH_SUA_THONG_TIN.value,
+                    changes_json,
+                    RequestStatus.CHO_DUYET.value,
+                ),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GUI_YEU_CAU_SUA_XE",
+            doi_tuong="yeu_cau_dang_ky_xe",
+            ma_doi_tuong=req_row["ma_yeu_cau_xe"] if req_row else None,
+            gia_tri_cu={"bien_so_xe": vehicle["bien_so_xe"], "ten_hang_dong_xe": vehicle["ten_hang_dong_xe"]},
+            gia_tri_moi=changes,
+        )
+        return {"request": req_row, "vehicle": vehicle}
+
+    def _submit_stop_vehicle_request(
+        self, session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """3.2.5: Gửi yêu cầu ngừng đăng ký xe (chặn nếu xe đang đỗ trong bãi)."""
+        reason = str(payload.get("ly_do") or payload.get("noi_dung_thay_doi") or "").strip()
+        if not reason:
+            reason = "Cư dân yêu cầu ngừng đăng ký sử dụng bãi giữ xe."
+
+        db = self._db()
+        with db.transaction() as tx:
+            ma_cu_dan, _, _ = self._resolve_resident_context(tx, session)
+            vehicle = self._verify_resident_owned_vehicle(
+                tx, ma_cu_dan, payload.get("ma_phuong_tien")
+            )
+            if bool(vehicle.get("dang_trong_bai")):
+                raise BusinessError(
+                    f"Xe '{vehicle['bien_so_xe']}' đang đỗ trong bãi. "
+                    "Vui lòng đưa xe ra khỏi bãi trước khi gửi yêu cầu ngừng đăng ký."
+                )
+
+            req_row = tx.execute_returning(
+                """
+                INSERT INTO yeu_cau_dang_ky_xe (
+                    ma_cu_dan, ma_phuong_tien, loai_yeu_cau,
+                    noi_dung_thay_doi, trang_thai_duyet
+                ) VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    ma_cu_dan,
+                    vehicle["ma_phuong_tien"],
+                    VehicleRequestTypes.NGUNG_DANG_KY.value,
+                    reason[:500],
+                    RequestStatus.CHO_DUYET.value,
+                ),
+            )
+
+        self.file_logger.log_audit(
+            ma_tai_khoan=session.ma_tai_khoan,
+            ten_dang_nhap=session.ten_dang_nhap or "",
+            vai_tro=session.vai_tro or "",
+            loai_thao_tac="GUI_YEU_CAU_NGUNG_XE",
+            doi_tuong="yeu_cau_dang_ky_xe",
+            ma_doi_tuong=req_row["ma_yeu_cau_xe"] if req_row else None,
+            gia_tri_cu={"bien_so_xe": vehicle["bien_so_xe"], "trang_thai_xe": vehicle["trang_thai_xe"]},
+            gia_tri_moi={"ly_do": reason[:500]},
+        )
+        return {"request": req_row, "vehicle": vehicle}
 
     def _submit_new_vehicle_request(
         self, session: ClientSession, payload: Dict[str, Any]
