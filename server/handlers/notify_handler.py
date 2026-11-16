@@ -500,6 +500,121 @@ class NotifyHandler:
             "recipients": updated_rows,
         }
 
+    # ==========================================================================
+    # 1.10.3: XEM THÔNG BÁO ĐÃ GỬI & THỐNG KÊ GỬI / TIẾP NHẬN / ĐỌC
+    # ==========================================================================
+    def handle_list_sent(
+        self, _session: ClientSession, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """1.10.3: Danh sách thông báo đã phát hành kèm thống kê chi tiết từ nguoi_nhan_thong_bao."""
+        db = self._db()
+        nhom = str(payload.get("nhom_nguoi_nhan") or "").strip()
+        loai = str(payload.get("loai_thong_bao") or "").strip()
+        muc_do = str(payload.get("muc_do") or "").strip()
+        start_date = str(payload.get("start_date") or "").strip()
+        end_date = str(payload.get("end_date") or "").strip()
+        keyword = str(payload.get("keyword") or "").strip()
+        ma_thong_bao = payload.get("ma_thong_bao")
+
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if ma_thong_bao not in (None, ""):
+            conditions.append("tb.ma_thong_bao = %s")
+            params.append(int(ma_thong_bao))
+        if nhom:
+            conditions.append("tb.nhom_nguoi_nhan = %s")
+            params.append(nhom)
+        if loai:
+            conditions.append("tb.loai_thong_bao = %s")
+            params.append(loai)
+        if muc_do:
+            conditions.append("tb.muc_do = %s")
+            params.append(muc_do)
+        if start_date:
+            conditions.append("DATE(tb.thoi_gian_gui) >= %s")
+            params.append(start_date[:10])
+        if end_date:
+            conditions.append("DATE(tb.thoi_gian_gui) <= %s")
+            params.append(end_date[:10])
+        if keyword:
+            like = f"%{keyword}%"
+            conditions.append("(tb.tieu_de ILIKE %s OR tb.noi_dung ILIKE %s)")
+            params.extend([like, like])
+
+        where_sql = " AND ".join(conditions)
+        notices = db.fetch_all(
+            f"""
+            SELECT tb.ma_thong_bao,
+                   tb.ma_nguoi_gui,
+                   COALESCE(nv.ho_ten, 'Ban Quản Lý') AS ten_nguoi_gui,
+                   tb.tieu_de,
+                   tb.noi_dung,
+                   tb.loai_thong_bao,
+                   tb.muc_do,
+                   tb.nhom_nguoi_nhan,
+                   tb.thoi_gian_gui
+            FROM thong_bao tb
+            LEFT JOIN nhan_vien nv ON nv.ma_nhan_vien = tb.ma_nguoi_gui
+            WHERE {where_sql}
+            ORDER BY tb.thoi_gian_gui DESC, tb.ma_thong_bao DESC
+            """,
+            tuple(params),
+        )
+
+        rec_rows = db.fetch_all(
+            """
+            SELECT nn.ma_tiep_nhan,
+                   nn.ma_thong_bao,
+                   nn.ma_tai_khoan_nhan,
+                   tk.ten_dang_nhap,
+                   tk.vai_tro,
+                   COALESCE(cd.ho_ten, nv.ho_ten, tk.ten_dang_nhap) AS ho_ten_nhan,
+                   nn.trang_thai_gui,
+                   nn.so_lan_gui_lai,
+                   nn.trang_thai_tiep_nhan,
+                   nn.da_doc,
+                   nn.thoi_gian_tiep_nhan
+            FROM nguoi_nhan_thong_bao nn
+            JOIN tai_khoan tk ON tk.ma_tai_khoan = nn.ma_tai_khoan_nhan
+            LEFT JOIN cu_dan cd ON cd.ma_tai_khoan = tk.ma_tai_khoan
+            LEFT JOIN nhan_vien nv ON nv.ma_tai_khoan = tk.ma_tai_khoan
+            ORDER BY nn.ma_tiep_nhan ASC
+            """
+        )
+
+        rec_by_notice: Dict[int, List[Dict[str, Any]]] = {}
+        for rec in rec_rows:
+            rec_by_notice.setdefault(int(rec["ma_thong_bao"]), []).append(rec)
+
+        items: List[Dict[str, Any]] = []
+        for tb in notices:
+            nid = int(tb["ma_thong_bao"])
+            recs = rec_by_notice.get(nid, [])
+            tong = len(recs)
+            ok_cnt = sum(1 for r in recs if r.get("trang_thai_gui") == NotifySendStatus.GUI_THANH_CONG.value)
+            fail_cnt = sum(1 for r in recs if r.get("trang_thai_gui") == NotifySendStatus.GUI_THAT_BAI.value)
+            ack_cnt = sum(1 for r in recs if r.get("trang_thai_tiep_nhan") == NotifyAckStatus.DA_TIEP_NHAN.value)
+            read_cnt = sum(1 for r in recs if bool(r.get("da_doc")))
+            retry_sum = sum(int(r.get("so_lan_gui_lai") or 0) for r in recs)
+            items.append(
+                {
+                    **tb,
+                    "tong_nguoi_nhan": tong,
+                    "so_gui_thanh_cong": ok_cnt,
+                    "so_gui_that_bai": fail_cnt,
+                    "so_da_tiep_nhan": ack_cnt,
+                    "so_chua_tiep_nhan": max(0, tong - ack_cnt),
+                    "so_da_doc": read_cnt,
+                    "tong_so_lan_gui_lai": retry_sum,
+                    "recipients": recs,
+                }
+            )
+
+        return {
+            "total": len(items),
+            "items": items,
+        }
+
 
 def register_notify_routes(
     router: Router,
@@ -532,6 +647,13 @@ def register_notify_routes(
         handler.handle_retry_failed,
         allowed_roles=[Roles.QUAN_LY.value],
         is_mutation=True,
+        require_auth=True,
+    )
+    router.register(
+        Actions.NOTIFY_LIST_SENT,
+        handler.handle_list_sent,
+        allowed_roles=[Roles.QUAN_LY.value, Roles.ADMIN.value],
+        is_mutation=False,
         require_auth=True,
     )
     return handler
