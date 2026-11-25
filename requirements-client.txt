@@ -1,0 +1,20 @@
+# =============================================================================
+# SMART PARKING — CLIENT DEPENDENCIES (PYSIDE6 DESKTOP APP)
+# Cài đặt trên máy trạm của nhân viên / quản lý / cư dân
+# =============================================================================
+
+# Giao diện Desktop PySide6 & Biểu đồ
+PySide6>=6.7.0
+matplotlib>=3.9.0
+
+# Kết nối mạng Dual-Transport (TCP Socket 5555 & WebSocket WSS)
+websocket-client>=1.8.0
+python-dotenv>=1.0.1
+
+# AI Nhận diện biển số xe (Edge / Client Camera Worker)
+google-genai>=2.30.1
+opencv-python>=4.10.0
+ultralytics>=8.3.0
+easyocr>=1.7.1
+numpy>=1.26.4
+Pillow>=10.4.0

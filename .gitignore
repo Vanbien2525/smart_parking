@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 *$py.class
 *.egg-info/
 dist/
@@ -13,6 +14,8 @@ env/
 
 # Environment variables & secrets
 .env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -36,3 +39,7 @@ storage/uploads/gates_out/*
 
 # Local progress tracking (chỉ lưu local, không push lên GitHub)
 progress.md
+
+!.env.render.example
+
+local_account_credentials.txt

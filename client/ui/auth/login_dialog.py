@@ -76,16 +76,25 @@ class LoginDialog(QDialog):
         conn_row.addWidget(self.badge_conn)
         conn_row.addStretch(1)
 
-        self.txt_host = QLineEdit(
-            self.socket_client.host if self.socket_client is not None else "127.0.0.1"
+        is_ws = (
+            self.socket_client is not None
+            and getattr(self.socket_client, "transport", "tcp") == "websocket"
         )
-        self.txt_host.setFixedWidth(120)
-        self.txt_host.setPlaceholderText("Host")
+        initial_host = (
+            self.socket_client.ws_url
+            if (is_ws and self.socket_client.ws_url)
+            else (self.socket_client.host if self.socket_client is not None else "127.0.0.1")
+        )
+        self.txt_host = QLineEdit(initial_host)
+        self.txt_host.setFixedWidth(200 if is_ws else 120)
+        self.txt_host.setPlaceholderText("URL WebSocket hoặc Host")
         self.txt_port = QLineEdit(
             str(self.socket_client.port if self.socket_client is not None else 5555)
         )
         self.txt_port.setFixedWidth(64)
         self.txt_port.setPlaceholderText("Port")
+        if is_ws:
+            self.txt_port.setVisible(False)
 
         self.btn_reconnect = QPushButton("Kết nối")
         set_button_variant(self.btn_reconnect, "default", "sm")
@@ -163,7 +172,14 @@ class LoginDialog(QDialog):
 
     def _on_connection_changed(self, connected: bool, message: str) -> None:
         if connected:
-            self.badge_conn.setText(f"Online · {self.socket_client.host}:{self.socket_client.port}")
+            if self.socket_client is not None and getattr(self.socket_client, "transport", "tcp") == "websocket":
+                url = self.socket_client.ws_url or f"ws://{self.socket_client.host}:{self.socket_client.port}/ws"
+                proto = "WSS" if url.startswith("wss://") else "WS"
+                self.badge_conn.setText(f"Online ({proto}) · {url}")
+            else:
+                host = self.socket_client.host if self.socket_client else "127.0.0.1"
+                port = self.socket_client.port if self.socket_client else 5555
+                self.badge_conn.setText(f"Online (TCP) · {host}:{port}")
             self.badge_conn.set_variant("success")
         else:
             self.badge_conn.setText(message or "Mất kết nối Server")
@@ -171,7 +187,12 @@ class LoginDialog(QDialog):
 
     def _sync_connection_badge(self) -> None:
         if self.socket_client is not None and self.socket_client.is_connected():
-            self.badge_conn.setText(f"Online · {self.socket_client.host}:{self.socket_client.port}")
+            if getattr(self.socket_client, "transport", "tcp") == "websocket":
+                url = self.socket_client.ws_url or f"ws://{self.socket_client.host}:{self.socket_client.port}/ws"
+                proto = "WSS" if url.startswith("wss://") else "WS"
+                self.badge_conn.setText(f"Online ({proto}) · {url}")
+            else:
+                self.badge_conn.setText(f"Online (TCP) · {self.socket_client.host}:{self.socket_client.port}")
             self.badge_conn.set_variant("success")
         else:
             self.badge_conn.setText("Chưa kết nối Server")
@@ -181,16 +202,49 @@ class LoginDialog(QDialog):
         if self.socket_client is None:
             self._show_error("Chưa khởi tạo SocketClient.")
             return
-        host = self.txt_host.text().strip() or "127.0.0.1"
+
+        raw_target = self.txt_host.text().strip()
+        self._clear_error()
+
+        # 1. Nếu người dùng nhập URL WebSocket (ws:// hoặc wss://):
+        if raw_target.startswith("ws://") or raw_target.startswith("wss://"):
+            ok = self.socket_client.connect_to_server(
+                ws_url=raw_target,
+                transport="websocket",
+                timeout=8.0,
+            )
+            if not ok:
+                self._show_error(f"Không thể kết nối WebSocket tới {raw_target}.")
+            return
+
+        # 2. Nếu client đang cấu hình transport là websocket:
+        if getattr(self.socket_client, "transport", "tcp") == "websocket":
+            target_url = self.socket_client.ws_url or f"ws://{raw_target or '127.0.0.1'}:8000/ws"
+            ok = self.socket_client.connect_to_server(
+                ws_url=target_url,
+                transport="websocket",
+                timeout=8.0,
+            )
+            if not ok:
+                self._show_error(f"Không thể kết nối WebSocket tới {target_url}.")
+            return
+
+        # 3. Chế độ TCP Socket truyền thống:
+        host = raw_target or "127.0.0.1"
         try:
             port = int(self.txt_port.text().strip() or "5555")
         except ValueError:
             self._show_error("Port kết nối phải là số nguyên.")
             return
-        self._clear_error()
-        ok = self.socket_client.connect_to_server(host=host, port=port, timeout=4.0)
+
+        ok = self.socket_client.connect_to_server(
+            host=host,
+            port=port,
+            transport="tcp",
+            timeout=5.0,
+        )
         if not ok:
-            self._show_error(f"Không thể kết nối tới {host}:{port}.")
+            self._show_error(f"Không thể kết nối TCP tới {host}:{port}.")
 
     def _toggle_password_visibility(self, checked: bool) -> None:
         self.txt_password.setEchoMode(

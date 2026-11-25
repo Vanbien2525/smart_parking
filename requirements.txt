@@ -1,4 +1,8 @@
-# Giao diện Desktop chuyên nghiệp & Biểu đồ
+# =============================================================================
+# SMART PARKING — UNIFIED DEPENDENCIES (DEV ENVIRONMENT)
+# =============================================================================
+
+# Giao diện Desktop PySide6 & Biểu đồ
 PySide6>=6.7.0
 matplotlib>=3.9.0
 
@@ -8,7 +12,17 @@ psycopg-pool>=3.2.0
 bcrypt>=4.1.0
 python-dotenv>=1.0.1
 
-# Nhận diện biển số thật (Hybrid: Gemini Vision API + OpenCV / YOLO / EasyOCR)
+# Tạo mã QR thanh toán
+qrcode>=7.4.2
+
+# Cloud Gateway & WebSocket Secure
+fastapi>=0.115.0
+uvicorn>=0.30.0
+websockets>=13.0
+websocket-client>=1.8.0
+starlette>=0.38.0
+
+# Nhận diện biển số xe (Hybrid: Gemini Vision API + OpenCV / YOLO / EasyOCR)
 google-genai>=2.30.1
 opencv-python>=4.10.0
 ultralytics>=8.3.0
@@ -16,9 +30,5 @@ easyocr>=1.7.1
 numpy>=1.26.4
 Pillow>=10.4.0
 
-# Tạo mã QR ảo thanh toán
-qrcode>=7.4.2
-
 # Kiểm thử tự động
 pytest>=8.0.0
-pytest-qt>=4.4.0

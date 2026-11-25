@@ -9,11 +9,16 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
+PARENT_ENV_PATH = BASE_DIR.parent / ".env"
 
+# Ưu tiên nạp .env tại BASE_DIR, sau đó đến thư mục cha (khi clone/extract lồng thư mục)
+# override=False đảm bảo không ghi đè biến môi trường thực tế trên Cloud Server (Render/Production)
 if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
+    load_dotenv(ENV_PATH, override=False)
+elif PARENT_ENV_PATH.exists():
+    load_dotenv(PARENT_ENV_PATH, override=False)
 else:
-    load_dotenv()
+    load_dotenv(override=False)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -37,14 +42,21 @@ class ServerConfig:
     heartbeat_timeout_seconds: int = _int_env("HEARTBEAT_TIMEOUT_SECONDS", 45)
     heartbeat_reap_interval_seconds: int = _int_env("HEARTBEAT_REAP_INTERVAL_SECONDS", 10)
 
-    # PostgreSQL
+    # PostgreSQL - Local & Neon Cloud
+    # PostgreSQL - Local & Neon Cloud
     db_host: str = os.getenv("DB_HOST", "localhost")
     db_port: int = _int_env("DB_PORT", 5432)
     db_name: str = os.getenv("DB_NAME", "smart_parking")
     db_user: str = os.getenv("DB_USER", "postgres")
     db_password: str = os.getenv("DB_PASSWORD", "")
+
+    db_sslmode: str = os.getenv("DB_SSLMODE", "prefer")
+    db_channel_binding: str = os.getenv("DB_CHANNEL_BINDING", "prefer")
+    db_connect_timeout: int = _int_env("DB_CONNECT_TIMEOUT", 15)
+
     db_pool_min: int = _int_env("DB_POOL_MIN", 2)
     db_pool_max: int = _int_env("DB_POOL_MAX", 10)
+    db_pool_timeout: float = float(_int_env("DB_POOL_TIMEOUT", 30))
 
     # SMTP OTP Email
     smtp_host: str = os.getenv("SMTP_HOST", "smtp.gmail.com")

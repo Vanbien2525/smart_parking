@@ -6,37 +6,42 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
 from psycopg.rows import dict_row
+from psycopg.conninfo import make_conninfo
 from psycopg_pool import ConnectionPool
 
 from server.config import DEFAULT_CONFIG, ServerConfig
+
+
 
 _POOL_LOCK = threading.RLock()
 _POOL: Optional[ConnectionPool] = None
 
 
 def build_conninfo(config: Optional[ServerConfig] = None) -> str:
-    """Tạo chuỗi kết nối PostgreSQL từ `ServerConfig`."""
+    """Tạo chuỗi kết nối PostgreSQL từ `ServerConfig` bằng make_conninfo chuẩn."""
     cfg = config or DEFAULT_CONFIG
-    parts = [
-        f"host={cfg.db_host}",
-        f"port={cfg.db_port}",
-        f"dbname={cfg.db_name}",
-        f"user={cfg.db_user}",
-    ]
-    if cfg.db_password:
-        parts.append(f"password={cfg.db_password}")
-    return " ".join(parts)
+    return make_conninfo(
+        host=cfg.db_host,
+        port=cfg.db_port,
+        dbname=cfg.db_name,
+        user=cfg.db_user,
+        password=cfg.db_password if cfg.db_password else None,
+        sslmode=cfg.db_sslmode,
+        channel_binding=cfg.db_channel_binding,
+        connect_timeout=cfg.db_connect_timeout,
+    )
 
 
 def init_pool(
     config: Optional[ServerConfig] = None,
     min_size: Optional[int] = None,
     max_size: Optional[int] = None,
-    open_timeout: float = 5.0,
+    open_timeout: Optional[float] = None,
 ) -> ConnectionPool:
-    """Khởi tạo ConnectionPool singleton (thread-safe)."""
+    """Khởi tạo ConnectionPool singleton (thread-safe, hỗ trợ Neon Cold Start & Stale Connection Recovery)."""
     global _POOL
     cfg = config or DEFAULT_CONFIG
+    timeout = open_timeout if open_timeout is not None else getattr(cfg, "db_pool_timeout", 30.0)
     with _POOL_LOCK:
         if _POOL is not None and not _POOL.closed:
             return _POOL
@@ -44,7 +49,11 @@ def init_pool(
             conninfo=build_conninfo(cfg),
             min_size=min_size if min_size is not None else cfg.db_pool_min,
             max_size=max_size if max_size is not None else cfg.db_pool_max,
-            timeout=open_timeout,
+            timeout=timeout,
+            check=ConnectionPool.check_connection,
+            max_idle=300.0,
+            max_lifetime=3600.0,
+            reconnect_timeout=30.0,
             kwargs={"row_factory": dict_row},
             open=True,
         )
@@ -61,13 +70,17 @@ def get_pool() -> ConnectionPool:
         return _POOL
 
 
-def close_pool() -> None:
-    """Đóng toàn bộ kết nối trong ConnectionPool khi tắt Server."""
+def close_pool(timeout: Optional[float] = None) -> None:
+    """Đóng toàn bộ kết nối trong ConnectionPool khi tắt Server (Graceful Shutdown)."""
     global _POOL
     with _POOL_LOCK:
         if _POOL is not None:
             try:
-                _POOL.close()
+                if not _POOL.closed:
+                    if timeout is not None:
+                        _POOL.close(timeout=timeout)
+                    else:
+                        _POOL.close()
             finally:
                 _POOL = None
 

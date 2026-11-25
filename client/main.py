@@ -23,7 +23,7 @@ def run_app(argv: Optional[list[str]] = None) -> int:
 
     socket_client = SocketClient()
     # Thử kết nối sẵn tới Server mặc định (nếu chưa bật, LoginDialog vẫn cho sửa Host/Port)
-    socket_client.connect_to_server(timeout=1.5)
+    socket_client.connect_to_server(timeout=3.0)
 
     try:
         while True:
@@ -50,7 +50,7 @@ def run_app(argv: Optional[list[str]] = None) -> int:
             if not reopen_login["flag"]:
                 break
             if not socket_client.is_connected():
-                socket_client.connect_to_server(timeout=1.5)
+                socket_client.connect_to_server(timeout=3.0)
     finally:
         socket_client.disconnect()
 

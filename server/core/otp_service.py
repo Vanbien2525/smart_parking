@@ -10,6 +10,7 @@ from email.message import EmailMessage
 from typing import Callable, Dict, Optional
 
 from server.config import ServerConfig
+from server.core.email_provider import get_email_provider
 
 
 @dataclass
@@ -41,7 +42,11 @@ class OTPService:
         email_sender: Optional[EmailSenderFn] = None,
     ) -> None:
         self._config = config or ServerConfig()
-        self._email_sender = email_sender or self._send_smtp_email
+        if email_sender is not None:
+            self._email_sender = email_sender
+        else:
+            provider = get_email_provider(self._config)
+            self._email_sender = provider.send_email
         self._lock = threading.RLock()
         self._records: Dict[str, OTPRecord] = {}
         self._reset_tokens: Dict[str, str] = {}  # reset_token -> request_id
